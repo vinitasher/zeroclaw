@@ -1401,12 +1401,18 @@ Allowlist Telegram username (without '@') or numeric user ID.",
         let mut shared_caption: Option<String> = None;
 
         for update in updates {
-            let Some(message) = update.get("message") else { continue };
-            let Some(attachment) = Self::parse_attachment_metadata(message) else { continue };
+            let Some(message) = update.get("message") else {
+                continue;
+            };
+            let Some(attachment) = Self::parse_attachment_metadata(message) else {
+                continue;
+            };
 
             if let Some(size) = attachment.file_size {
                 if size > TELEGRAM_MAX_FILE_DOWNLOAD_BYTES {
-                    tracing::info!("Skipping media-group attachment: file size {size} bytes exceeds limit");
+                    tracing::info!(
+                        "Skipping media-group attachment: file size {size} bytes exceeds limit"
+                    );
                     continue;
                 }
             }
@@ -1426,12 +1432,18 @@ Allowlist Telegram username (without '@') or numeric user ID.",
 
             let tg_file_path = match self.get_file_path(&attachment.file_id).await {
                 Ok(p) => p,
-                Err(e) => { tracing::warn!("Failed to get media-group file path: {e}"); continue; }
+                Err(e) => {
+                    tracing::warn!("Failed to get media-group file path: {e}");
+                    continue;
+                }
             };
 
             let file_data = match self.download_file(&tg_file_path).await {
                 Ok(d) => d,
-                Err(e) => { tracing::warn!("Failed to download media-group attachment: {e}"); continue; }
+                Err(e) => {
+                    tracing::warn!("Failed to download media-group attachment: {e}");
+                    continue;
+                }
             };
 
             let local_filename = match &attachment.file_name {
@@ -1444,7 +1456,10 @@ Allowlist Telegram username (without '@') or numeric user ID.",
 
             let local_path = save_dir.join(&local_filename);
             if let Err(e) = tokio::fs::write(&local_path, &file_data).await {
-                tracing::warn!("Failed to save media-group attachment to {}: {e}", local_path.display());
+                tracing::warn!(
+                    "Failed to save media-group attachment to {}: {e}",
+                    local_path.display()
+                );
                 continue;
             }
 
