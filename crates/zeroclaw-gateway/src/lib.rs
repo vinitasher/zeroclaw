@@ -12,6 +12,8 @@
 //! - Request timeouts (30s) to prevent slow-loris attacks
 //! - Header sanitization (handled by axum/hyper)
 
+#[cfg(feature = "a2a")]
+pub mod a2a;
 pub mod acp;
 pub mod api;
 pub mod api_browse;
@@ -1709,6 +1711,9 @@ pub async fn run_gateway(
             "/api/canvas/{id}/history",
             get(canvas::handle_canvas_history),
         );
+
+    #[cfg(feature = "a2a")]
+    let inner = inner.merge(a2a::a2a_routes());
 
     // ── WebAuthn hardware key authentication API (requires webauthn feature) ──
     #[cfg(feature = "webauthn")]
