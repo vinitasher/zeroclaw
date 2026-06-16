@@ -21,7 +21,7 @@ curl http://localhost:42617/.well-known/agents-card.json
 Second, ask one of those agents what it can do:
 
 ```
-curl http://localhost:42617/a2a/translator/.well-known/agent-card.json
+curl http://localhost:42617/a2a/agent_alpha/.well-known/agent-card.json
 ```
 
 The first request gives you a list of agent URLs. The second gives you one
@@ -47,12 +47,12 @@ Response:
             "protocolVersion": "1.0"
         },
         {
-            "url": "http://localhost:42617/a2a/invoicer",
+            "url": "http://localhost:42617/a2a/agent_beta",
             "protocolBinding": "JSONRPC",
             "protocolVersion": "1.0"
         },
         {
-            "url": "http://localhost:42617/a2a/translator",
+            "url": "http://localhost:42617/a2a/agent_alpha",
             "protocolBinding": "JSONRPC",
             "protocolVersion": "1.0"
         }
@@ -67,16 +67,34 @@ Response:
     "defaultOutputModes": ["text"],
     "skills": [
         {
-            "id": "translator/translate",
-            "name": "Translate",
-            "description": "Translate text between languages.",
-            "tags": ["translator"]
+            "id": "agent_beta/github-issue-triage",
+            "name": "github-issue-triage",
+            "description": "Issue triage and lifecycle management agent for ZeroClaw.",
+            "tags": ["github", "issues", "triage", "agent_beta"]
         },
         {
-            "id": "invoicer/draft-invoice",
-            "name": "Draft Invoice",
-            "description": "Draft an invoice line item from a description and amount.",
-            "tags": ["invoicer"]
+            "id": "agent_beta/github-pr-review-session",
+            "name": "github-pr-review-session",
+            "description": "Human-reviewer co-pilot for ZeroClaw PR reviews.",
+            "tags": ["github", "pull-requests", "review", "agent_beta"]
+        },
+        {
+            "id": "agent_alpha/zeroclaw",
+            "name": "zeroclaw",
+            "description": "Help users operate and interact with their ZeroClaw agent instance.",
+            "tags": ["operations", "cli", "gateway", "agent_alpha"]
+        },
+        {
+            "id": "agent_alpha/skill-creator",
+            "name": "skill-creator",
+            "description": "Create new skills, modify and improve existing skills, and measure skill performance.",
+            "tags": ["skills", "authoring", "evaluation", "agent_alpha"]
+        },
+        {
+            "id": "agent_alpha/changelog-generation",
+            "name": "changelog-generation",
+            "description": "Changelog generation skill for ZeroClaw releases.",
+            "tags": ["changelog", "release", "automation", "agent_alpha"]
         }
     ]
 }
@@ -84,7 +102,7 @@ Response:
 
 Read it like this. `supportedInterfaces` lists URLs. The one tagged `catalog` is
 this list itself, ignore it. The two tagged `JSONRPC` are the agents:
-`translator` and `invoicer`. Their URLs are where you will send work. `skills`
+`agent_alpha` and `agent_beta`. Their URLs are where you will send work. `skills`
 aggregates every published agent's skills, each `id` prefixed and `tags`-tagged
 with the owning alias, so one read shows the whole install's capability surface
 and who owns each piece.
@@ -94,18 +112,18 @@ and who owns each piece.
 Take a URL from the list and append the card path:
 
 ```
-curl http://localhost:42617/a2a/translator/.well-known/agent-card.json
+curl http://localhost:42617/a2a/agent_alpha/.well-known/agent-card.json
 ```
 
 Response:
 
 ```json
 {
-    "name": "translator",
-    "description": "ZeroClaw agent 'translator'.",
+    "name": "agent_alpha",
+    "description": "ZeroClaw agent 'agent_alpha'.",
     "supportedInterfaces": [
         {
-            "url": "http://localhost:42617/a2a/translator",
+            "url": "http://localhost:42617/a2a/agent_alpha",
             "protocolBinding": "JSONRPC",
             "protocolVersion": "1.0"
         }
@@ -120,40 +138,48 @@ Response:
     "defaultOutputModes": ["text"],
     "skills": [
         {
-            "id": "translate-text",
-            "name": "Translate Text",
-            "description": "Translate a short text between English and Spanish.",
+            "id": "zeroclaw",
+            "name": "zeroclaw",
+            "description": "Help users operate and interact with their ZeroClaw agent instance.",
+            "tags": ["operations", "cli", "gateway"]
         },
         {
-            "id": "detect-language",
-            "name": "Detect Language",
-            "description": "Detect the language of a given snippet of text.",
+            "id": "skill-creator",
+            "name": "skill-creator",
+            "description": "Create new skills, modify and improve existing skills, and measure skill performance.",
+            "tags": ["skills", "authoring", "evaluation"]
+        },
+        {
+            "id": "changelog-generation",
+            "name": "changelog-generation",
+            "description": "Changelog generation skill for ZeroClaw releases.",
+            "tags": ["changelog", "release", "automation"]
         }
     ]
 }
 ```
 
-Now you know three things. The agent is named `translator`. It has two skills,
-`translate-text` and `detect-language`, with plain descriptions of what each
-does. And the single `JSONRPC` interface URL, `http://localhost:42617/a2a/translator`,
-is the address you POST a task to.
+Now you know three things. The agent is named `agent_alpha`. It has three skills,
+`zeroclaw`, `skill-creator`, and `changelog-generation`, with plain descriptions
+of what each does. And the single `JSONRPC` interface URL,
+`http://localhost:42617/a2a/agent_alpha`, is the address you POST a task to.
 
 ## What an agent chooses to show
 
-An agent does not have to publish every skill it has. The `invoicer` agent in
-this same deployment has two skills on disk but publishes only one:
+An agent does not have to publish every skill it has. The `agent_beta` agent in
+this same deployment publishes its own selected set:
 
 ```
-curl http://localhost:42617/a2a/invoicer/.well-known/agent-card.json
+curl http://localhost:42617/a2a/agent_beta/.well-known/agent-card.json
 ```
 
 ```json
 {
-    "name": "invoicer",
-    "description": "ZeroClaw agent 'invoicer'.",
+    "name": "agent_beta",
+    "description": "ZeroClaw agent 'agent_beta'.",
     "supportedInterfaces": [
         {
-            "url": "http://localhost:42617/a2a/invoicer",
+            "url": "http://localhost:42617/a2a/agent_beta",
             "protocolBinding": "JSONRPC",
             "protocolVersion": "1.0"
         }
@@ -168,17 +194,22 @@ curl http://localhost:42617/a2a/invoicer/.well-known/agent-card.json
     "defaultOutputModes": ["text"],
     "skills": [
         {
-            "id": "draft-invoice",
-            "name": "Draft Invoice",
-            "description": "Draft an invoice line item from a description and amount.",
+            "id": "github-issue-triage",
+            "name": "github-issue-triage",
+            "description": "Issue triage and lifecycle management agent for ZeroClaw."
+        },
+        {
+            "id": "github-pr-review-session",
+            "name": "github-pr-review-session",
+            "description": "Human-reviewer co-pilot for ZeroClaw PR reviews."
         }
     ]
 }
 ```
 
-It has a `tax-estimate` skill too. It is not on the card. The deployment chose to
-expose only `draft-invoice`. That is the whole point of publishing: you decide
-per agent which skills the outside world can see.
+The deployment chose which agents to publish and which skills each one exposes.
+That is the whole point of publishing: you decide per agent which skills the
+outside world can see.
 
 ## Sending a task
 
@@ -186,7 +217,7 @@ Once you have an agent's interface URL and a skill, you send work as a JSON-RPC
 `message/send` POST to that URL:
 
 ```
-curl -X POST http://localhost:42617/a2a/translator \
+curl -X POST http://localhost:42617/a2a/agent_alpha \
   -H 'Content-Type: application/json' \
   -d '{
     "jsonrpc": "2.0",
@@ -195,7 +226,7 @@ curl -X POST http://localhost:42617/a2a/translator \
     "params": {
       "message": {
         "role": "user",
-        "parts": [{ "kind": "text", "text": "Translate to Spanish: good morning" }]
+        "parts": [{ "kind": "text", "text": "Reply with PONG" }]
       }
     }
   }'
@@ -206,20 +237,27 @@ part inside the task's artifact:
 
 ```
 {
-  "jsonrpc": "2.0",
-  "id": 1,
-  "result": {
-    "id": "ab381abc-f744-4bb4-8635-e0d6f9f43592",
-    "contextId": "a2a_translator_ce7318d7-d687-4581-9d8b-4facd5527aec",
-    "kind": "task",
-    "status": { "state": "completed" },
-    "artifacts": [
-      {
-        "artifactId": "44978c13-7fd4-4e35-934f-edc9f175b9dd",
-        "parts": [{ "kind": "text", "text": "buenos días" }]
-      }
-    ]
-  }
+    "id": 1,
+    "jsonrpc": "2.0",
+    "result": {
+        "artifacts": [
+            {
+                "artifactId": "5346ae32-1b63-40c0-9aaa-345d815c792e",
+                "parts": [
+                    {
+                        "kind": "text",
+                        "text": "PONG"
+                    }
+                ]
+            }
+        ],
+        "contextId": "a2a_agent_alpha_06cb22f5-12bf-4b26-9ebc-9c063ab520a4",
+        "id": "0ef19fcb-b5e4-4c26-afce-d80451c8861e",
+        "kind": "task",
+        "status": {
+            "state": "completed"
+        }
+    }
 }
 ```
 

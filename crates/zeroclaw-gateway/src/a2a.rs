@@ -259,11 +259,17 @@ fn exposed_skills(config: &Config, alias: &str) -> Vec<AgentSkill> {
         if let Some(summary) = resolved.iter().find(|s| {
             s.r#ref.name() == wanted && agent.skill_bundles.iter().any(|b| b == s.r#ref.bundle())
         }) {
+            let mut tags = vec![summary.r#ref.bundle().to_string()];
+            if let Some(category) = &summary.frontmatter.category {
+                if !category.is_empty() {
+                    tags.push(category.clone());
+                }
+            }
             out.push(AgentSkill {
                 id: summary.r#ref.name().to_string(),
                 name: summary.frontmatter.name.clone(),
                 description: summary.frontmatter.description.clone(),
-                tags: Vec::new(),
+                tags,
             });
         }
     }
