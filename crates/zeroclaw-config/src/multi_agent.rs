@@ -164,6 +164,93 @@ pub struct PeerGroupConfig {
     pub output_modality: OutputModality,
 }
 
+/// `[a2a.server]` — inbound A2A discovery server.
+///
+/// Wrapped under `[a2a.server]` (two-level) via [`A2aServerSection`] so the
+/// `a2a` table can grow sibling sub-tables later (e.g. client config) without
+/// a breaking move.
+#[derive(Debug, Clone, Serialize, Deserialize, Configurable)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[prefix = "a2a_server"]
+#[serde(default)]
+pub struct A2aServerConfig {
+    /// Master switch for the inbound A2A surface. Default `false`: no
+    /// well-known route, no per-alias cards, no inbound endpoints.
+    pub enabled: bool,
+    /// Bind address for the A2A server. Defaults to loopback; set a
+    /// non-loopback address only with deliberate network exposure.
+    pub bind: String,
+    /// Listen port for the A2A server.
+    pub port: u16,
+    /// Externally reachable base URL advertised in card endpoint fields
+    /// (e.g. `https://agents.example.com`). When empty, endpoints are
+    /// derived from `bind`/`port`. Set this behind a reverse proxy so
+    /// advertised URLs match the public origin.
+    pub public_base_url: String,
+}
+
+impl Default for A2aServerConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            bind: default_a2a_bind(),
+            port: default_a2a_port(),
+            public_base_url: String::new(),
+        }
+    }
+}
+
+fn default_a2a_bind() -> String {
+    "127.0.0.1".into()
+}
+
+fn default_a2a_port() -> u16 {
+    18800
+}
+
+/// `[a2a]` section wrapper. Holds the inbound `[a2a.server]` block. Kept as a
+/// dedicated wrapper so the `a2a` table can host sibling sub-tables (outbound
+/// client config, signing) in later slices without moving `server`.
+///
+/// Server-level exposure gate for A2A agent discovery. Default-closed: the
+/// server serves nothing until `[a2a.server] enabled = true`, and even then
+/// only aliases that opt in via `[agents.<alias>.a2a] published = true`
+/// appear. Binds to localhost by default; public exposure is an explicit
+/// operator choice. See `crates/zeroclaw-gateway/src/a2a.rs`.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, Configurable)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[prefix = "a2a"]
+#[serde(default)]
+pub struct A2aServerSection {
+    /// Inbound A2A discovery server (`[a2a.server]`).
+    #[nested]
+    pub server: A2aServerConfig,
+}
+
+/// Per-alias A2A publication block (`[agents.<alias>.a2a]`).
+///
+/// Default-closed second gate: even with the server enabled, an alias is
+/// absent from discovery until `published = true`. `exposed_skills` is a
+/// filter over the alias's resolved skill set (from `skill_bundles` /
+/// `mcp_bundles`), never a parallel registry: empty means expose no skills
+/// on the card; a non-empty list selects which resolved skill ids appear.
+/// The bundles remain the single source of truth for what the agent can do.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, Configurable)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[prefix = "agent_a2a"]
+#[serde(default)]
+pub struct AgentA2aConfig {
+    /// Publish this alias as a discoverable A2A agent. Default `false`:
+    /// the alias is excluded from the discovery catalog and serves no
+    /// per-alias card even when the server is enabled.
+    pub published: bool,
+    /// Filter selecting which resolved skill ids appear on this alias's
+    /// card. Empty = no skills advertised. Entries that do not resolve to
+    /// a real skill in the alias's bundles are dropped (the bundles are
+    /// canonical; this only selects from them).
+    pub exposed_skills: Vec<String>,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -349,5 +436,49 @@ output_modality = "voice"
         // Omitting the field falls back to mirror (current behavior).
         let defaulted: PeerGroupConfig = toml::from_str(r#"channel = "telegram""#).unwrap();
         assert_eq!(defaulted.output_modality, OutputModality::Mirror);
+    }
+
+    #[test]
+    fn a2a_server_config_default_is_closed_and_loopback() {
+        let cfg = A2aServerConfig::default();
+        assert!(!cfg.enabled);
+        assert_eq!(cfg.bind, "127.0.0.1");
+        assert_eq!(cfg.port, 18800);
+        assert!(cfg.public_base_url.is_empty());
+    }
+
+    #[test]
+    fn a2a_server_config_round_trips() {
+        let toml_input = r#"
+enabled = true
+bind = "0.0.0.0"
+port = 9000
+public_base_url = "https://agents.example.com"
+"#;
+        let parsed: A2aServerConfig = toml::from_str(toml_input).unwrap();
+        assert!(parsed.enabled);
+        assert_eq!(parsed.bind, "0.0.0.0");
+        assert_eq!(parsed.port, 9000);
+        assert_eq!(parsed.public_base_url, "https://agents.example.com");
+    }
+
+    #[test]
+    fn agent_a2a_config_default_is_unpublished_with_no_skills() {
+        let cfg = AgentA2aConfig::default();
+        assert!(!cfg.published);
+        assert!(cfg.exposed_skills.is_empty());
+    }
+
+    #[test]
+    fn agent_a2a_config_round_trips_with_exposed_skills_filter() {
+        let toml_input = r#"
+published = true
+exposed_skills = ["research", "summarize"]
+"#;
+        let parsed: AgentA2aConfig = toml::from_str(toml_input).unwrap();
+        assert!(parsed.published);
+        assert_eq!(parsed.exposed_skills.len(), 2);
+        assert_eq!(parsed.exposed_skills[0], "research");
+        assert_eq!(parsed.exposed_skills[1], "summarize");
     }
 }

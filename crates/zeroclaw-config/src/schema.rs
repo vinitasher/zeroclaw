@@ -280,6 +280,14 @@ pub struct Config {
     #[group = "Network"]
     pub gateway: GatewayConfig,
 
+    /// Inbound A2A discovery server (`[a2a.server]`). Default-closed:
+    /// serves the well-known catalog card and per-alias agent cards only
+    /// when `enabled = true`. See `crate::multi_agent::A2aServerConfig`.
+    #[serde(default)]
+    #[nested]
+    #[group = "Network"]
+    pub a2a: crate::multi_agent::A2aServerSection,
+
     /// WebSocket Secure (WSS) transport for remote TUI connections (`[wss]`).
     #[serde(default)]
     #[nested]
@@ -3387,6 +3395,16 @@ pub struct AliasedAgentConfig {
     #[serde(default)]
     #[nested]
     pub identity: IdentityConfig,
+
+    /// Per-agent A2A publication block (`[agents.<alias>.a2a]`). Gates
+    /// whether this alias is discoverable as a spec-conforming A2A agent
+    /// and which resolved skills appear on its card. Default-closed
+    /// (`published = false`, no exposed skills). See
+    /// `crate::multi_agent::AgentA2aConfig`.
+    #[tab(General)]
+    #[serde(default)]
+    #[nested]
+    pub a2a: crate::multi_agent::AgentA2aConfig,
 }
 
 impl Default for AliasedAgentConfig {
@@ -3410,6 +3428,7 @@ impl Default for AliasedAgentConfig {
             workspace: crate::multi_agent::AgentWorkspaceConfig::default(),
             memory: crate::multi_agent::AgentMemoryConfig::default(),
             identity: IdentityConfig::default(),
+            a2a: crate::multi_agent::AgentA2aConfig::default(),
         }
     }
 }
@@ -14900,6 +14919,7 @@ impl Default for Config {
             storage: StorageConfig::default(),
             tunnel: TunnelConfig::default(),
             gateway: GatewayConfig::default(),
+            a2a: crate::multi_agent::A2aServerSection::default(),
             wss: WssConfig::default(),
             composio: ComposioConfig::default(),
             microsoft365: Microsoft365Config::default(),
@@ -19806,6 +19826,7 @@ auto_save = true
             storage: StorageConfig::default(),
             tunnel: TunnelConfig::default(),
             gateway: GatewayConfig::default(),
+            a2a: crate::multi_agent::A2aServerSection::default(),
             wss: WssConfig::default(),
             composio: ComposioConfig::default(),
             microsoft365: Microsoft365Config::default(),
@@ -20468,6 +20489,7 @@ default_temperature = 0.7
             storage: StorageConfig::default(),
             tunnel: TunnelConfig::default(),
             gateway: GatewayConfig::default(),
+            a2a: crate::multi_agent::A2aServerSection::default(),
             wss: WssConfig::default(),
             composio: ComposioConfig::default(),
             microsoft365: Microsoft365Config::default(),
