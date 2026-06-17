@@ -114,25 +114,24 @@ pub struct WhatsAppWebChannel {
     /// When non-empty, only group messages matching at least one pattern are
     /// processed; matched fragments are stripped from the forwarded content.
     group_mention_patterns: Arc<Vec<regex::Regex>>,
-    /// Allowed group chats by JID. Empty = all groups permitted. A non-empty
-    /// list drops group messages whose chat JID matches no entry (full JID or
-    /// exact JID user part). Direct messages bypass. See
-    /// `WhatsAppConfig::allowed_groups`.
-    allowed_groups: Arc<Vec<String>>,
+    /// Resolves allowed group chats from canonical config at message-time.
+    /// Empty = all groups permitted. Direct messages bypass.
+    allowed_groups_resolver: Arc<dyn Fn() -> Vec<String> + Send + Sync>,
 }
 
 impl WhatsAppWebChannel {
     /// Create a new WhatsApp Web channel from a `WhatsAppConfig`.
     ///
     /// `config` is the schema block under `[channels.whatsapp.<alias>]`;
-    /// `alias` is that alias key; `peer_resolver` resolves inbound
-    /// external peers from canonical state at message-time (no cache —
-    /// see AGENTS.md "ABSOLUTE RULE — SINGLE SOURCE OF TRUTH").
+    /// `alias` is that alias key; resolvers read authorization inputs from
+    /// canonical state at message-time (no cache — see AGENTS.md
+    /// "ABSOLUTE RULE — SINGLE SOURCE OF TRUTH").
     #[cfg(feature = "whatsapp-web")]
     pub fn new(
         config: &zeroclaw_config::schema::WhatsAppConfig,
         alias: impl Into<String>,
         peer_resolver: Arc<dyn Fn() -> Vec<String> + Send + Sync>,
+        allowed_groups_resolver: Arc<dyn Fn() -> Vec<String> + Send + Sync>,
     ) -> Self {
         let session_path = config.session_path.clone().unwrap_or_default();
         let pair_phone = config.pair_phone.clone();
@@ -143,7 +142,6 @@ impl WhatsAppWebChannel {
         let dm_policy = config.dm_policy.clone();
         let group_policy = config.group_policy.clone();
         let self_chat_mode = config.self_chat_mode;
-        let allowed_groups = Arc::new(config.allowed_groups.clone());
 
         // Seed bot_phone from pair_phone (digits only)
         let bot_phone = pair_phone
@@ -176,7 +174,7 @@ impl WhatsAppWebChannel {
             dm_policy,
             group_policy,
             self_chat_mode,
-            allowed_groups,
+            allowed_groups_resolver,
             bot_handle: Arc::new(Mutex::new(None)),
             client: Arc::new(Mutex::new(None)),
             tx: Arc::new(Mutex::new(None)),
@@ -1378,7 +1376,7 @@ impl Channel for WhatsAppWebChannel {
             let bot_lid_clone = self.bot_lid.clone();
             let wa_dm_mention_patterns = self.dm_mention_patterns.clone();
             let wa_group_mention_patterns = self.group_mention_patterns.clone();
-            let wa_allowed_groups = self.allowed_groups.clone();
+            let allowed_groups_resolver = Arc::clone(&self.allowed_groups_resolver);
 
             // whatsapp-rust 0.6: BotBuilder gained a 4th typestate slot for the
             // async runtime (oxidezap/whatsapp-rust#621). `with_runtime` is
@@ -1415,7 +1413,7 @@ impl Channel for WhatsAppWebChannel {
                     let bot_lid_inner = bot_lid_clone.clone();
                     let wa_dm_mention_patterns = wa_dm_mention_patterns.clone();
                     let wa_group_mention_patterns = wa_group_mention_patterns.clone();
-                    let wa_allowed_groups = wa_allowed_groups.clone();
+                    let allowed_groups_resolver = Arc::clone(&allowed_groups_resolver);
                     async move {
                         // whatsapp-rust 0.6: event handlers receive `Arc<Event>`
                         // per PR #613, so we match against `&*event` to get a
@@ -1464,7 +1462,8 @@ impl Channel for WhatsAppWebChannel {
                                 // before the chat-type policy block. An empty
                                 // list permits all groups; DMs bypass via the
                                 // `is_group` guard.
-                                if is_group && !is_group_chat_allowed(&chat, &wa_allowed_groups) {
+                                let allowed_groups = allowed_groups_resolver();
+                                if is_group && !is_group_chat_allowed(&chat, &allowed_groups) {
                                     ::zeroclaw_log::record!(
                                         DEBUG,
                                         ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
@@ -2123,6 +2122,7 @@ mod tests {
             &cfg,
             "whatsapp_web_test_alias",
             Arc::new(|| vec!["+1234567890".into()]),
+            Arc::new(Vec::new),
         );
         assert_eq!(ch.name(), "whatsapp");
     }
@@ -2143,6 +2143,7 @@ mod tests {
             &cfg,
             "whatsapp_web_test_alias",
             Arc::new(|| vec!["+1234567890".into()]),
+            Arc::new(Vec::new),
         );
         assert!(ch.is_number_allowed("+1234567890"));
         assert!(!ch.is_number_allowed("+9876543210"));
@@ -2164,6 +2165,7 @@ mod tests {
             &cfg,
             "whatsapp_web_test_alias",
             Arc::new(|| vec!["*".into()]),
+            Arc::new(Vec::new),
         );
         assert!(ch.is_number_allowed("+1234567890"));
         assert!(ch.is_number_allowed("+9999999999"));
@@ -2181,7 +2183,12 @@ mod tests {
             self_chat_mode,
             ..Default::default()
         };
-        let ch = WhatsAppWebChannel::new(&cfg, "whatsapp_web_test_alias", Arc::new(Vec::new));
+        let ch = WhatsAppWebChannel::new(
+            &cfg,
+            "whatsapp_web_test_alias",
+            Arc::new(Vec::new),
+            Arc::new(Vec::new),
+        );
         // Empty allowlist means "deny all" (matches channel-wide allowlist policy).
         assert!(!ch.is_number_allowed("+1234567890"));
     }
@@ -2202,6 +2209,7 @@ mod tests {
             &cfg,
             "whatsapp_web_test_alias",
             Arc::new(|| vec!["+1234567890".into()]),
+            Arc::new(Vec::new),
         );
         assert_eq!(ch.normalize_phone("1234567890"), "+1234567890");
     }
@@ -2222,6 +2230,7 @@ mod tests {
             &cfg,
             "whatsapp_web_test_alias",
             Arc::new(|| vec!["+1234567890".into()]),
+            Arc::new(Vec::new),
         );
         assert_eq!(ch.normalize_phone("+1234567890"), "+1234567890");
     }
@@ -2242,6 +2251,7 @@ mod tests {
             &cfg,
             "whatsapp_web_test_alias",
             Arc::new(|| vec!["+1234567890".into()]),
+            Arc::new(Vec::new),
         );
         assert_eq!(
             ch.normalize_phone("1234567890@s.whatsapp.net"),
@@ -2391,6 +2401,7 @@ mod tests {
             &cfg,
             "whatsapp_web_test_alias",
             Arc::new(|| vec!["+1234567890".into()]),
+            Arc::new(Vec::new),
         );
         assert!(!ch.health_check().await);
     }
@@ -2500,6 +2511,7 @@ mod tests {
             &cfg,
             "whatsapp_web_test_alias",
             Arc::new(|| vec!["+1234567890".into()]),
+            Arc::new(Vec::new),
         )
         .with_transcription(tc);
         assert!(ch.transcription.is_some());
@@ -2523,6 +2535,7 @@ mod tests {
             &cfg,
             "whatsapp_web_test_alias",
             Arc::new(|| vec!["+1234567890".into()]),
+            Arc::new(Vec::new),
         )
         .with_transcription(tc);
         assert!(ch.transcription.is_none());
@@ -2897,6 +2910,7 @@ mod tests {
             &cfg,
             "whatsapp_web_test_alias",
             Arc::new(|| vec!["*".into()]),
+            Arc::new(Vec::new),
         );
         assert_eq!(*ch.bot_phone.lock(), Some("919211916069".to_string()));
         assert_eq!(*ch.bot_lid.lock(), None);
@@ -2918,6 +2932,7 @@ mod tests {
             &cfg,
             "whatsapp_web_test_alias",
             Arc::new(|| vec!["*".into()]),
+            Arc::new(Vec::new),
         );
         assert_eq!(*ch.bot_phone.lock(), None);
     }
