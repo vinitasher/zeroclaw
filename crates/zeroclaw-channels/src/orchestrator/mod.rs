@@ -3841,7 +3841,15 @@ async fn process_channel_message_body(
 
     // ── Media pipeline: enrich inbound message with media annotations ──
     if ctx.media_pipeline.enabled && !msg.attachments.is_empty() {
-        let vision = ctx.model_provider.supports_vision();
+        // Check the default provider AND the configured vision route: when a
+        // dedicated vision_model_provider is set (via [multimodal]), the media
+        // pipeline must embed base64 image data even if the default text
+        // provider lacks vision capability. Otherwise the media pipeline
+        // strips image data to a plain filename ref, and by the time the
+        // runtime's vision_route.rs correctly routes to the vision provider
+        // the raw image bytes are gone.
+        let vision = ctx.model_provider.supports_vision()
+            || ctx.multimodal.vision_model_provider.is_some();
         let transcription_manager =
             crate::transcription::TranscriptionManager::new(&ctx.transcription_config)
                 .ok()
