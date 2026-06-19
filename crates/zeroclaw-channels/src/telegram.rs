@@ -10,6 +10,11 @@ use zeroclaw_api::channel::{Channel, ChannelMessage, SendMessage};
 use zeroclaw_config::schema::{Config, StreamMode, TELEGRAM_OFFICIAL_API_BASE_URL};
 use zeroclaw_runtime::security::pairing::PairingGuard;
 
+/// Maximum time (ms) to wait for additional media group items before flushing.
+/// Telegram delivers all items in a media group within a single poll response
+/// in practice, so this is a safety timeout for the rare cross-poll case.
+const TELEGRAM_MEDIA_GROUP_FLUSH_MS: u64 = 500;
+
 /// Telegram's maximum message length for text messages
 const TELEGRAM_MAX_MESSAGE_LENGTH: usize = 4096;
 const TELEGRAM_CONTINUED_PREFIX: &str = "(continued)\n\n";
@@ -570,6 +575,11 @@ pub struct TelegramChannel {
     /// tool approval prompt before auto-denying. Configurable via
     /// `channels.telegram.approval_timeout_secs`. Default: 120.
     approval_timeout_secs: u64,
+    /// Buffer for media group (album) messages awaiting batching.
+    /// Key is `chat_id:media_group_id`, value is the collected messages and the
+    /// `Instant` when the group was first seen (for cross-poll flush timeout).
+    media_group_buf:
+        Arc<std::sync::Mutex<std::collections::HashMap<String, (Vec<ChannelMessage>, std::time::Instant)>>>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -629,6 +639,7 @@ impl TelegramChannel {
             tool_command_specs: Vec::new(),
             pending_approvals: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
             approval_timeout_secs: 120,
+            media_group_buf: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
         }
     }
 
@@ -3904,12 +3915,109 @@ Ensure only one `zeroclaw` process is using this bot token."
                         .send()
                         .await; // Ignore errors for typing indicator
 
-                    if tx.send(msg).await.is_err() {
-                        return Ok(());
+                    // ── Media group (album) batching ──────────────────────────
+                    // When Telegram sends an album it dispatches each photo/document
+                    // as a separate update, all sharing the same `media_group_id`.
+                    // We buffer them and flush as a single agent request.
+                    const MEDIA_GROUP_FLUSH_MS: u64 = 500;
+
+                    let media_group_id = update
+                        .get("message")
+                        .and_then(|m| m.get("media_group_id"))
+                        .and_then(serde_json::Value::as_str)
+                        .map(|s| s.to_owned());
+
+                    if let Some(ref mgid) = media_group_id {
+                        let key = format!("{}:{}", msg.reply_target, mgid);
+                        let mut buf = self.media_group_buf.lock().unwrap();
+                        let is_first = buf.get(&key).is_none();
+                        let entry = buf.entry(key.clone()).or_insert_with(|| {
+                            (Vec::new(), std::time::Instant::now())
+                        });
+                        entry.0.push(msg);
+
+                        if is_first {
+                            // Spawn a background flush after a short delay so
+                            // subsequent messages in the same album can arrive.
+                            let buf_arc = self.media_group_buf.clone();
+                            let tx_clone = tx.clone();
+                            tokio::spawn(async move {
+                                tokio::time::sleep(std::time::Duration::from_millis(
+                                    MEDIA_GROUP_FLUSH_MS,
+                                ))
+                                .await;
+                                let mut buf = buf_arc.lock().unwrap();
+                                if let Some((msgs, _first_seen)) = buf.remove(&key) {
+                                    if let Some(merged) =
+                                        Self::merge_media_group_messages(msgs)
+                                    {
+                                        let _ = tx_clone.send(merged).await;
+                                    }
+                                }
+                            });
+                        }
+                    } else {
+                        // Not a media group — send immediately.
+                        if tx.send(msg).await.is_err() {
+                            return Ok(());
+                        }
                     }
                 }
             }
         }
+    }
+
+    /// Merge several media-group (album) messages into a single agent request.
+    /// Concatenates attachment markers and deduplicates captions.
+    fn merge_media_group_messages(
+        mut msgs: Vec<ChannelMessage>,
+    ) -> Option<ChannelMessage> {
+        if msgs.is_empty() {
+            return None;
+        }
+        // Use the first message's metadata (sender, reply_target, etc.)
+        let base = msgs.remove(0);
+        if msgs.is_empty() {
+            return Some(base);
+        }
+
+        // Collect content parts. base already holds the first piece.
+        let mut parts = Vec::with_capacity(msgs.len() + 1);
+        // Split base.content on double-newline to separate attachment marker from caption.
+        let (base_body, base_caption) = base
+            .content
+            .split_once("\n\n")
+            .map(|(b, c)| (b.to_owned(), Some(c.to_owned())))
+            .unwrap_or_else(|| (base.content.clone(), None));
+        parts.push(base_body);
+
+        let mut caption = base_caption;
+        for m in msgs {
+            let (body, cap) = m
+                .content
+                .split_once("\n\n")
+                .map(|(b, c)| (b.to_owned(), Some(c.to_owned())))
+                .unwrap_or_else(|| (m.content, None));
+            parts.push(body);
+            // Later messages may have a caption; take the last one found.
+            if cap.is_some() {
+                caption = cap;
+            }
+        }
+
+        let mut merged_content = parts.join("\n");
+        if let Some(cap) = caption
+            && !cap.is_empty()
+        {
+            use std::fmt::Write;
+            let _ = write!(merged_content, "\n\n{cap}");
+        }
+
+        Some(ChannelMessage {
+            content: merged_content,
+            id: format!("{}_{}", base.id, msgs.len() + 1),
+            ..base
+        })
     }
 
     async fn health_check(&self) -> bool {
