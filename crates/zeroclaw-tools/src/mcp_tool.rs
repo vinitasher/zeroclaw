@@ -1,7 +1,7 @@
 //! Wraps a discovered MCP tool as a zeroclaw [`Tool`] so it is dispatched
 //! through the existing tool registry and agent loop without modification.
 
-use std::sync::Arc;
+use std::sync::{Arc, Weak};
 
 use async_trait::async_trait;
 
@@ -13,6 +13,10 @@ use zeroclaw_api::tool::{Tool, ToolResult};
 ///
 /// The `prefixed_name` (e.g. `filesystem__read_file`) is what the agent loop
 /// sees. The registry knows how to route it to the correct server.
+///
+/// Uses `Weak<McpRegistry>` so the registry can be dropped and stdio child
+/// processes reaped (via `kill_on_drop`) when the agent run ends, even if
+/// wrappers are still alive in skill-elevation or other transient handles.
 pub struct McpToolWrapper {
     /// Prefixed name: `<server_name>__<tool_name>`.
     prefixed_name: String,
@@ -21,8 +25,10 @@ pub struct McpToolWrapper {
     description: String,
     /// JSON schema for the tool's input parameters.
     input_schema: serde_json::Value,
-    /// Shared registry — used to dispatch actual tool calls.
-    registry: Arc<McpRegistry>,
+    /// Shared registry (weak reference) — used to dispatch actual tool calls.
+    /// Upgraded to Arc at call time so the registry can be dropped when all
+    /// agent runs end, allowing stdio child processes to be reaped.
+    registry: Weak<McpRegistry>,
 }
 
 impl McpToolWrapper {
@@ -32,7 +38,7 @@ impl McpToolWrapper {
             prefixed_name,
             description,
             input_schema: def.input_schema,
-            registry,
+            registry: Arc::downgrade(&registry),
         }
     }
 }
@@ -64,7 +70,20 @@ impl Tool for McpToolWrapper {
             }
             other => other,
         };
-        match self.registry.call_tool(&self.prefixed_name, args).await {
+        let registry = match self.registry.upgrade() {
+            Some(r) => r,
+            None => {
+                return Ok(ToolResult {
+                    success: false,
+                    output: String::new(),
+                    error: Some(format!(
+                        "MCP registry dropped; cannot call tool `{}`",
+                        self.prefixed_name
+                    )),
+                });
+            }
+        };
+        match registry.call_tool(&self.prefixed_name, args).await {
             Ok(output) => Ok(ToolResult {
                 success: true,
                 output,
