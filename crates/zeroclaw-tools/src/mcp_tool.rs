@@ -178,11 +178,17 @@ mod tests {
         // rather than propagating an Err (non-fatal by design).
         let registry = empty_registry().await;
         let def = make_def("ghost", Some("Ghost tool"), json!({}));
-        let wrapper = McpToolWrapper::new("nowhere__ghost".to_string(), def, registry);
+        // Keep a strong `Arc` alive across the call: the wrapper now holds only a
+        // `Weak`, mirroring the agent runtime that owns the registry while its
+        // tools execute. Without this the registry would drop before `execute()`
+        // and the `Weak` would fail to upgrade (yielding a "registry dropped"
+        // error instead of the expected unknown-tool error).
+        let wrapper = McpToolWrapper::new("nowhere__ghost".to_string(), def, registry.clone());
         let result = wrapper
             .execute(json!({}))
             .await
             .expect("execute should be non-fatal");
+        drop(registry);
         assert!(!result.success);
         let err_msg = result.error.expect("error message should be present");
         assert!(
