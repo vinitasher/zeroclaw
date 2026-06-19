@@ -3848,8 +3848,8 @@ async fn process_channel_message_body(
         // strips image data to a plain filename ref, and by the time the
         // runtime's vision_route.rs correctly routes to the vision provider
         // the raw image bytes are gone.
-        let vision = ctx.model_provider.supports_vision()
-            || ctx.multimodal.vision_model_provider.is_some();
+        let vision =
+            ctx.model_provider.supports_vision() || ctx.multimodal.vision_model_provider.is_some();
         let transcription_manager =
             crate::transcription::TranscriptionManager::new(&ctx.transcription_config)
                 .ok()
