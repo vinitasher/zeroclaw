@@ -11,8 +11,8 @@ echo "==> rust quality: cargo fmt --all -- --check"
 cargo fmt --all -- --check
 
 if [ "$MODE" = "strict" ]; then
-    echo "==> rust quality: cargo clippy --locked --all-targets -- -D warnings"
-    cargo clippy --locked --all-targets -- -D warnings
+    echo "==> rust quality: cargo clippy --locked --all-targets --all-features -- -D warnings"
+    cargo clippy --locked --all-targets --all-features -- -D warnings
 else
     echo "==> rust quality: cargo clippy --locked --all-targets -- -D clippy::correctness"
     cargo clippy --locked --all-targets -- -D clippy::correctness
