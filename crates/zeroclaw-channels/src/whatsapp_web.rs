@@ -87,6 +87,11 @@ pub struct WhatsAppWebChannel {
     group_policy: zeroclaw_config::schema::WhatsAppChatPolicy,
     /// Whether to always respond in self-chat when mode = personal
     self_chat_mode: bool,
+    /// Allowed group chats by JID. When non-empty, only group messages
+    /// whose chat JID matches an entry are processed. Direct messages
+    /// bypass this filter. Each entry matches as a full JID
+    /// (`123456789012345@g.us`) or a JID prefix (`123456789012345`).
+    allowed_groups: Vec<String>,
     /// Bot handle for shutdown.
     /// whatsapp-rust 0.6: `Bot::run()` now returns `BotHandle` (a Future + abort)
     /// rather than a tokio JoinHandle directly (oxidezap/whatsapp-rust BotHandle wrapper).
@@ -143,6 +148,7 @@ impl WhatsAppWebChannel {
         let dm_policy = config.dm_policy.clone();
         let group_policy = config.group_policy.clone();
         let self_chat_mode = config.self_chat_mode;
+        let allowed_groups = config.allowed_groups.clone();
 
         // Seed bot_phone from pair_phone (digits only)
         let bot_phone = pair_phone
@@ -175,6 +181,7 @@ impl WhatsAppWebChannel {
             dm_policy,
             group_policy,
             self_chat_mode,
+            allowed_groups,
             bot_handle: Arc::new(Mutex::new(None)),
             client: Arc::new(Mutex::new(None)),
             tx: Arc::new(Mutex::new(None)),
@@ -309,6 +316,24 @@ impl WhatsAppWebChannel {
                 (Some(entry_norm), Some(phone_norm)) => entry_norm == phone_norm,
                 _ => false,
             }
+        })
+    }
+
+    /// Check whether a chat JID is allowed by the `allowed_groups` list.
+    ///
+    /// Each entry is matched as either a full JID (`123456789012345@g.us`) or
+    /// a digit-only prefix (`123456789012345`). Direct-message chats
+    /// (`@s.whatsapp.net`) always return `true` (bypass).
+    #[cfg(feature = "whatsapp-web")]
+    fn is_chat_allowed(chat: &str, allowed_groups: &[String]) -> bool {
+        // DMs always bypass the group filter.
+        if chat.ends_with("@s.whatsapp.net") {
+            return true;
+        }
+        let chat_user = chat.split_once('@').map(|(u, _)| u).unwrap_or(chat);
+        allowed_groups.iter().any(|entry| {
+            entry == chat      // full JID match: "123456789012345@g.us"
+            || entry == chat_user  // digit-only prefix match: "123456789012345"
         })
     }
 
@@ -1775,6 +1800,7 @@ impl Channel for WhatsAppWebChannel {
             let bot_lid_clone = self.bot_lid.clone();
             let wa_dm_mention_patterns = self.dm_mention_patterns.clone();
             let wa_group_mention_patterns = self.group_mention_patterns.clone();
+            let wa_allowed_groups = self.allowed_groups.clone();
 
             // whatsapp-rust 0.6: BotBuilder gained a 4th typestate slot for the
             // async runtime (oxidezap/whatsapp-rust#621). `with_runtime` is
@@ -1811,6 +1837,7 @@ impl Channel for WhatsAppWebChannel {
                     let bot_lid_inner = bot_lid_clone.clone();
                     let wa_dm_mention_patterns = wa_dm_mention_patterns.clone();
                     let wa_group_mention_patterns = wa_group_mention_patterns.clone();
+                    let wa_allowed_groups = wa_allowed_groups.clone();
                     async move {
                         // whatsapp-rust 0.6: event handlers receive `Arc<Event>`
                         // per PR #613, so we match against `&*event` to get a
@@ -1853,6 +1880,14 @@ impl Channel for WhatsAppWebChannel {
 
                                 let is_group = info.source.is_group;
                                 let reply_target = Self::compute_reply_target(&chat);
+
+                                // ── Allowed-groups filter (runs before personal-mode policy) ──
+                                if !wa_allowed_groups.is_empty() && is_group
+                                    && !Self::is_chat_allowed(&chat, &wa_allowed_groups)
+                                {
+                                    ::zeroclaw_log::record!(DEBUG, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_attrs(::serde_json::json!({"chat": chat})), &format!("dropping group message: chat not in allowed_groups (chat={})", chat));
+                                    return;
+                                }
 
                                 // ── Personal-mode chat-type policy filtering ──
                                 if wa_mode == zeroclaw_config::schema::WhatsAppWebMode::Personal {
@@ -2356,6 +2391,7 @@ impl WhatsAppWebChannel {
         _dm_policy: zeroclaw_config::schema::WhatsAppChatPolicy,
         _group_policy: zeroclaw_config::schema::WhatsAppChatPolicy,
         _self_chat_mode: bool,
+        _allowed_groups: Vec<String>,
     ) -> Self {
         Self { _private: () }
     }
@@ -2675,6 +2711,43 @@ mod tests {
             &allowed,
             "+1 (555) 123-4567"
         ));
+    }
+
+    #[test]
+    #[cfg(feature = "whatsapp-web")]
+    fn whatsapp_web_allowed_groups_empty_list_allows_all() {
+        let allowed: Vec<String> = vec![];
+        assert!(WhatsAppWebChannel::is_chat_allowed("123456789@g.us", &allowed));
+        assert!(WhatsAppWebChannel::is_chat_allowed("999@g.us", &allowed));
+    }
+
+    #[test]
+    #[cfg(feature = "whatsapp-web")]
+    fn whatsapp_web_allowed_groups_full_jid_match() {
+        let allowed = vec!["123456789@g.us".to_string()];
+        assert!(WhatsAppWebChannel::is_chat_allowed("123456789@g.us", &allowed));
+    }
+
+    #[test]
+    #[cfg(feature = "whatsapp-web")]
+    fn whatsapp_web_allowed_groups_jid_prefix_match() {
+        let allowed = vec!["123456789".to_string()];
+        assert!(WhatsAppWebChannel::is_chat_allowed("123456789@g.us", &allowed));
+    }
+
+    #[test]
+    #[cfg(feature = "whatsapp-web")]
+    fn whatsapp_web_allowed_groups_no_match_drops() {
+        let allowed = vec!["111@g.us".to_string()];
+        assert!(!WhatsAppWebChannel::is_chat_allowed("222@g.us", &allowed));
+    }
+
+    #[test]
+    #[cfg(feature = "whatsapp-web")]
+    fn whatsapp_web_allowed_groups_dm_bypasses_filter() {
+        let allowed = vec!["111@g.us".to_string()];
+        // DMs (@s.whatsapp.net) always pass regardless of allowed_groups
+        assert!(WhatsAppWebChannel::is_chat_allowed("1234567890@s.whatsapp.net", &allowed));
     }
 
     #[test]

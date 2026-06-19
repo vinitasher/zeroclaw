@@ -43,10 +43,25 @@ For Web mode, `mode = "personal"` applies separate DM, group, and self-chat poli
 |---|---|---|
 | `dm_policy` | `allowlist`, `ignore`, `all` | Controls direct messages |
 | `group_policy` | `allowlist`, `ignore`, `all` | Controls group chats |
+| `allowed_groups` | List of group JIDs | Restricts bot to specific group chats (Web mode only) |
 | `self_chat_mode` | `true`, `false` | Controls the user's self-chat |
 | `mention_only` | `true`, `false` | Requires group messages to mention the bot |
 
 The default `mode = "business"` does not apply the personal DM/group policy split. For peer-gated regular-account deployments, use `mode = "personal"` with `dm_policy = "allowlist"` and `group_policy = "allowlist"`.
+
+### Restricting to specific groups
+
+Use `allowed_groups` to limit the bot to a named set of group chats (Web mode only):
+
+```toml
+[channels_config.whatsapp]
+session_path = "~/.zeroclaw/whatsapp-session.db"
+allowed_groups = ["123456789012345@g.us", "987654321098765"]
+```
+
+Each entry is either a full group JID (`123456789012345@g.us`) or a digit-only prefix (`123456789012345`). When the list is non-empty, the bot drops every group message whose chat JID matches no entry. Direct messages bypass this filter regardless of list contents. An empty list (the default) permits all groups.
+
+This field is independent of `dm_policy` and `group_policy`. For a DM-only bot, set `dm_policy = Allowlist` and `group_policy = Ignore` — no need to enumerate groups.
 
 ## Configuration surfaces
 

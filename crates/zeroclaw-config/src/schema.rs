@@ -12861,6 +12861,15 @@ pub struct WhatsAppConfig {
     #[tab(Advanced)]
     #[serde(default)]
     pub self_chat_mode: bool,
+    /// Allowed group chats by JID. When non-empty, only group messages
+    /// whose chat JID matches an entry are processed; everything else
+    /// is dropped silently. Direct messages bypass this filter.
+    /// Each entry matches as a full JID (`123456789012345@g.us`) or
+    /// a JID prefix (`123456789012345`). An empty list permits all
+    /// groups (current default).
+    #[tab(Advanced)]
+    #[serde(default)]
+    pub allowed_groups: Vec<String>,
     /// Regex patterns for DM mention gating (case-insensitive).
     /// When non-empty, only direct messages matching at least one pattern are
     /// processed; matched fragments are stripped from the forwarded content.
