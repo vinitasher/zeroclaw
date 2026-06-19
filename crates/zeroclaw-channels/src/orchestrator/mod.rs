@@ -8303,10 +8303,30 @@ fn build_owner_by_channel_key(
         for ch in &agent_cfg.channels {
             let ch_str: &str = ch.as_ref();
             owner_by_channel_key.insert(ch_str.to_string(), alias_str.clone());
-            if let Some((bare, _)) = ch_str.split_once('.') {
+            if let Some((bare, alias)) = ch_str.split_once('.') {
                 owner_by_channel_key
                     .entry(bare.to_string())
                     .or_insert_with(|| alias_str.clone());
+
+                // When the agent binds to a `lark.<alias>` channel and the
+                // config has `use_feishu = true`, the Lark channel handle
+                // announces itself as `"feishu"` (not `"lark"`) in the
+                // ChannelMessage's `channel` field. Register the Feishu
+                // composite and bare keys so AgentRouter::resolve can find
+                // the owning agent.
+                if bare == "lark" {
+                    if let Some(lk) = config.channels.lark.get(alias) {
+                        if lk.use_feishu {
+                            let feishu_composite = format!("feishu.{alias}");
+                            owner_by_channel_key
+                                .entry(feishu_composite)
+                                .or_insert_with(|| alias_str.clone());
+                            owner_by_channel_key
+                                .entry("feishu".to_string())
+                                .or_insert_with(|| alias_str.clone());
+                        }
+                    }
+                }
             }
         }
     }
