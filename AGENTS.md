@@ -178,6 +178,39 @@ Branch/commit/PR rules:
 - Follow `.github/pull_request_template.md` fully.
 - Never commit secrets, personal data, or real identity information (see `@docs/book/src/contributing/privacy.md`).
 
+## Pre-PR Preflight Gate
+
+**Mandatory for automated / agentic contributors — run before opening any PR.**
+
+```bash
+scripts/agent-preflight.sh "fix(scope): your conventional-commit title"
+```
+
+Idempotent (auto-applies `rustfmt`; everything else is read-only). It runs the
+**same gates CI enforces**, so a green preflight means a green PR:
+
+1. `cargo fmt --all` then `--check` — CI's `Format` job gates everything; an
+   unformatted branch skips all other checks and fails `CI Required Gate`.
+2. `scripts/ci/rust_quality_gate.sh --strict` — clippy `-D warnings` plus the
+   provider-dispatch SSOT gate.
+3. `cargo check --all-targets --locked` — every target must compile. Never push
+   code you did not build.
+4. `cargo test --locked`.
+5. `scripts/check-pr-title.sh "<title>"` — the `main` check requires Conventional
+   Commits **with a scope** (`type(scope): description`); `[Bug]:` / `[Tracker]:`
+   / `[Feature]:` titles are rejected.
+
+A non-zero exit is a hard gate: fix and re-run before pushing — do not open a PR
+on red. Pipelines must additionally:
+
+- **Dedupe by issue** — before opening a PR, check for an existing open PR that
+  references the target issue; if one exists, push to its branch instead of
+  opening a second (competing PRs cannot both merge).
+- **Use the human author identity** with no AI-attribution footers (see the PR
+  template and the privacy contract).
+- **Rate-limit** PRs per repo per run to avoid flooding review and CI.
+
+
 ## Anti-Patterns
 
 - Do not add heavy dependencies for minor convenience.
