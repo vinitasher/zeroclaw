@@ -15,6 +15,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::sync::mpsc;
 use tokio_tungstenite::tungstenite::Message as WsMessage;
 use zeroclaw_api::channel::{Channel, ChannelMessage, SendMessage};
+use zeroclaw_api::media::MediaAttachment;
 use zeroclaw_config::schema::{StreamMode, WeComWsConfig};
 use zeroclaw_runtime::i18n;
 
@@ -323,6 +324,117 @@ impl WeComWsChannel {
         tx.send(WsOutbound::Frame(frame))
             .await
             .map_err(|_| anyhow::Error::msg("WeCom WS outbound channel closed"))
+    }
+
+    /// Upload a media file to WeCom and return the media_id.
+    async fn http_upload_media(&self, attachment: &MediaAttachment) -> Result<String> {
+        let mime = attachment
+            .mime_type
+            .as_deref()
+            .unwrap_or("application/octet-stream");
+        let part_name = if mime.starts_with("image/") {
+            "image"
+        } else {
+            "file"
+        };
+
+        let form = reqwest::multipart::Form::new()
+            .part(
+                part_name,
+                reqwest::multipart::Part::bytes(attachment.data.clone())
+                    .file_name(attachment.file_name.clone())
+                    .mime_str(mime)
+                    .map_err(|e| anyhow::anyhow!("invalid MIME type {mime}: {e}"))?,
+            )
+            .text("type", part_name.to_string());
+
+        let url = format!(
+            "https://qyapi.weixin.qq.com/cgi-bin/media/upload?access_token={}&type={}",
+            self.get_access_token(),
+            part_name
+        );
+
+        let resp = self
+            .client
+            .post(&url)
+            .timeout(Duration::from_secs(WECOM_HTTP_TIMEOUT_SECS))
+            .send_multipart(form)
+            .await
+            .context("media upload HTTP request failed")?;
+
+        let body: Value = resp
+            .json()
+            .await
+            .context("media upload response was not JSON")?;
+
+        let errcode = body
+            .get("errcode")
+            .and_then(Value::as_i64)
+            .unwrap_or(0);
+        if errcode != 0 {
+            let errmsg = body.get("errmsg").and_then(Value::as_str).unwrap_or("");
+            anyhow::bail!("WeCom media upload failed: errcode={errcode} errmsg={errmsg}");
+        }
+
+        body.get("media_id")
+            .and_then(Value::as_str)
+            .map(str::to_string)
+            .context("media_id missing from upload response")
+    }
+
+    /// Upload a media file to WeCom and return the media_id, using a caller-specified type.
+    async fn http_upload_media_with_type(
+        &self,
+        attachment: &MediaAttachment,
+        part_name: &str,
+    ) -> Result<String> {
+        let mime = attachment
+            .mime_type
+            .as_deref()
+            .unwrap_or("application/octet-stream");
+
+        let form = reqwest::multipart::Form::new()
+            .part(
+                part_name,
+                reqwest::multipart::Part::bytes(attachment.data.clone())
+                    .file_name(attachment.file_name.clone())
+                    .mime_str(mime)
+                    .map_err(|e| anyhow::anyhow!("invalid MIME type {mime}: {e}"))?,
+            )
+            .text("type", part_name.to_string());
+
+        let url = format!(
+            "https://qyapi.weixin.qq.com/cgi-bin/media/upload?access_token={}&type={}",
+            self.get_access_token(),
+            part_name
+        );
+
+        let resp = self
+            .client
+            .post(&url)
+            .timeout(Duration::from_secs(WECOM_HTTP_TIMEOUT_SECS))
+            .send_multipart(form)
+            .await
+            .context("media upload HTTP request failed")?;
+
+        let body: Value = resp
+            .json()
+            .await
+            .context("media upload response was not JSON")?;
+
+        let errcode = body
+            .get("errcode")
+            .and_then(Value::as_i64)
+            .unwrap_or(0);
+        if errcode != 0 {
+            let errmsg = body.get("errmsg").and_then(Value::as_str).unwrap_or("");
+            anyhow::bail!("WeCom media upload failed: errcode={errcode} errmsg={errmsg}");
+        }
+
+        body.get("media_id")
+            .and_then(Value::as_str)
+            .map(str::to_string)
+            .context("media_id missing from upload response")
     }
 
     async fn ws_send_frame_and_wait_for_response(
@@ -1454,6 +1566,7 @@ impl Channel for WeComWsChannel {
     }
 
     async fn send(&self, message: &SendMessage) -> Result<()> {
+        // Handle streaming reply (thread_ts set) first.
         if let Some(req_id) = message
             .thread_ts
             .as_deref()
@@ -1474,11 +1587,84 @@ impl Channel for WeComWsChannel {
                     .await?;
             }
 
+            // If there are attachments, upload and send them after the text.
+            for attachment in &message.attachments {
+                self.send_attachment_to_scope(&message.recipient, attachment)
+                    .await?;
+            }
+
             return Ok(());
         }
 
+        // Proactive message: send text and then any attachments.
         self.send_markdown_chunks_to_scope(&message.recipient, &message.content)
-            .await
+            .await?;
+
+        for attachment in &message.attachments {
+            self.send_attachment_to_scope(&message.recipient, attachment)
+                .await?;
+        }
+
+        Ok(())
+    }
+
+    /// Upload a media file to WeCom and send it to the given scope.
+    async fn send_attachment_to_scope(
+        &self,
+        scope: &str,
+        attachment: &MediaAttachment,
+    ) -> Result<()> {
+        let mime = attachment
+            .mime_type
+            .as_deref()
+            .unwrap_or("application/octet-stream");
+
+        let (msgtype, part_name) = if mime.starts_with("image/") {
+            ("image", "image")
+        } else {
+            ("file", "file")
+        };
+
+        // Upload the file to WeCom to get a media_id.
+        let media_id = self.http_upload_media_with_type(attachment, part_name).await?;
+
+        // Send the media to the scope using the WeCom WebSocket API.
+        self.ws_send_media_to_scope(
+            scope,
+            &media_id,
+            msgtype,
+            &attachment.file_name,
+        )
+        .await
+    }
+
+    /// Send media (image/file) to a WeCom scope via aibot_send_msg.
+    async fn ws_send_media_to_scope(
+        &self,
+        scope: &str,
+        media_id: &str,
+        msgtype: &str,
+        file_name: &str,
+    ) -> Result<()> {
+        let (chat_type, chatid) = parse_scope(scope)?;
+        let req_id = random_ascii_token(16);
+        let frame = serde_json::json!({
+            "cmd": "aibot_send_msg",
+            "headers": { "req_id": req_id },
+            "body": {
+                "chatid": chatid,
+                "chat_type": chat_type,
+                "msgtype": msgtype,
+                "image": { "media_id": media_id },
+                "file": { "media_id": media_id },
+            }
+        });
+        self.ws_send_frame_and_wait_for_response(frame, &req_id, "aibot_send_msg")
+            .await?;
+        wecom_log_info!(
+            "WeCom media sent scope={scope} msgtype={msgtype} media_id={media_id} file_name={file_name}"
+        );
+        Ok(())
     }
 
     async fn listen(&self, tx: tokio::sync::mpsc::Sender<ChannelMessage>) -> Result<()> {
@@ -3654,5 +3840,156 @@ mod tests {
             }))
             .await;
         second.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn proactive_send_with_attachments_sends_text_then_media() {
+        let mut cfg = test_wecom_ws_config();
+        cfg.allowed_users = vec!["zeroclaw_user".to_string()];
+        let channel = WeComWsChannel::new(&cfg, Path::new("/tmp")).unwrap();
+
+        let (ws_tx, mut ws_rx) = mpsc::channel::<WsOutbound>(8);
+        *channel.ws_tx.lock().await = Some(ws_tx);
+
+        // Pre-load an access token so HTTP upload succeeds.
+        channel
+            .access_token
+            .lock()
+            .replace(zeroclaw_config::schema::CachedToken {
+                token: "test-token".to_string(),
+                expires_at: std::time::Instant::now()
+                    + std::time::Duration::from_secs(3600),
+            });
+
+        let image_data = b"fake-jpeg-bytes".to_vec();
+        let attachment = MediaAttachment {
+            file_name: "photo.jpg".to_string(),
+            data: image_data,
+            mime_type: Some("image/jpeg".to_string()),
+        };
+
+        let msg = SendMessage::new("hello", "user--zeroclaw_user")
+            .with_attachment(attachment);
+
+        // Override the HTTP client to return a fake upload response.
+        let channel_clone = channel.clone();
+        let _join = zeroclaw_spawn::spawn!(async move {
+            // Consume the ws frames: first aibot_send_msg (markdown), then aibot_send_msg (image).
+            let first_frame = ws_rx.recv().await.unwrap();
+            let WsOutbound::Frame(frame) = first_frame else {
+                panic!("expected frame");
+            };
+            assert_eq!(
+                frame.get("cmd").and_then(Value::as_str),
+                Some("aibot_send_msg")
+            );
+            assert_eq!(
+                frame.pointer("/body/msgtype").and_then(Value::as_str),
+                Some("markdown")
+            );
+
+            // Respond to the markdown send.
+            channel_clone
+                .maybe_handle_command_response(&serde_json::json!({
+                    "headers": {
+                        "req_id": frame
+                            .get("headers")
+                            .and_then(|h| h.get("req_id"))
+                            .and_then(Value::as_str)
+                    },
+                    "errcode": 0,
+                    "errmsg": "ok"
+                }))
+                .await;
+
+            // Expect the image send frame.
+            let second_frame = ws_rx.recv().await.unwrap();
+            let WsOutbound::Frame(img_frame) = second_frame else {
+                panic!("expected frame");
+            };
+            assert_eq!(
+                img_frame.get("cmd").and_then(Value::as_str),
+                Some("aibot_send_msg")
+            );
+            assert_eq!(
+                img_frame.pointer("/body/msgtype").and_then(Value::as_str),
+                Some("image")
+            );
+            assert!(
+                img_frame.pointer("/body/image/media_id")
+                    .and_then(Value::as_str)
+                    .is_some(),
+                "image frame must contain media_id"
+            );
+
+            channel_clone
+                .maybe_handle_command_response(&serde_json::json!({
+                    "headers": {
+                        "req_id": img_frame
+                            .get("headers")
+                            .and_then(|h| h.get("req_id"))
+                            .and_then(Value::as_str)
+                    },
+                    "errcode": 0,
+                    "errmsg": "ok"
+                }))
+                .await;
+        });
+
+        channel.send(&msg).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn ws_send_media_to_scope_builds_correct_image_frame() {
+        let cfg = test_wecom_ws_config();
+        let channel = WeComWsChannel::new(&cfg, Path::new("/tmp")).unwrap();
+
+        let (ws_tx, mut ws_rx) = mpsc::channel::<WsOutbound>(4);
+        *channel.ws_tx.lock().await = Some(ws_tx);
+
+        channel
+            .ws_send_media_to_scope("user--zeroclaw_user", "media123", "image", "photo.jpg")
+            .await
+            .unwrap();
+
+        let frame = ws_rx.recv().await.unwrap();
+        let WsOutbound::Frame(frame) = frame else {
+            panic!("expected frame");
+        };
+        assert_eq!(frame.get("cmd").and_then(Value::as_str), Some("aibot_send_msg"));
+        assert_eq!(frame.pointer("/body/chatid").and_then(Value::as_str), Some("zeroclaw_user"));
+        assert_eq!(frame.pointer("/body/chat_type").and_then(Value::as_str), Some("single"));
+        assert_eq!(frame.pointer("/body/msgtype").and_then(Value::as_str), Some("image"));
+        assert_eq!(
+            frame.pointer("/body/image/media_id").and_then(Value::as_str),
+            Some("media123")
+        );
+    }
+
+    #[tokio::test]
+    async fn ws_send_media_to_scope_builds_correct_file_frame() {
+        let cfg = test_wecom_ws_config();
+        let channel = WeComWsChannel::new(&cfg, Path::new("/tmp")).unwrap();
+
+        let (ws_tx, mut ws_rx) = mpsc::channel::<WsOutbound>(4);
+        *channel.ws_tx.lock().await = Some(ws_tx);
+
+        channel
+            .ws_send_media_to_scope("group--mygroup", "media456", "file", "doc.pdf")
+            .await
+            .unwrap();
+
+        let frame = ws_rx.recv().await.unwrap();
+        let WsOutbound::Frame(frame) = frame else {
+            panic!("expected frame");
+        };
+        assert_eq!(frame.get("cmd").and_then(Value::as_str), Some("aibot_send_msg"));
+        assert_eq!(frame.pointer("/body/chatid").and_then(Value::as_str), Some("mygroup"));
+        assert_eq!(frame.pointer("/body/chat_type").and_then(Value::as_str), Some("group"));
+        assert_eq!(frame.pointer("/body/msgtype").and_then(Value::as_str), Some("file"));
+        assert_eq!(
+            frame.pointer("/body/file/media_id").and_then(Value::as_str),
+            Some("media456")
+        );
     }
 }
