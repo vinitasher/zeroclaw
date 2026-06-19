@@ -1,6 +1,7 @@
 //! MCP transport abstraction — supports stdio, SSE, and HTTP transports.
 
 use std::borrow::Cow;
+use std::process::Stdio as ProcStdio;
 
 use anyhow::{Context, Result, bail};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
@@ -93,7 +94,8 @@ pub trait McpTransportConn: Send + Sync {
     async fn send_and_recv(&mut self, request: &JsonRpcRequest) -> Result<JsonRpcResponse>;
 
     /// Reset per-connection session state so the next operation re-establishes
-    /// a fresh session. Default is a no-op for stateless transports (stdio).
+    /// a fresh session. Default is a no-op for stateless transports (HTTP, SSE).
+    /// `StdioTransport` overrides this to kill and re-spawn the child process.
     async fn reset(&mut self) -> Result<()> {
         Ok(())
     }
@@ -109,6 +111,10 @@ pub struct StdioTransport {
     _child: Child,
     stdin: tokio::process::ChildStdin,
     stdout_lines: tokio::io::Lines<BufReader<tokio::process::ChildStdout>>,
+    /// Spawning parameters retained so the child can be re-spawned on reset.
+    spawn_cmd: String,
+    spawn_args: Vec<String>,
+    spawn_env: std::collections::HashMap<String, String>,
 }
 
 impl StdioTransport {
@@ -116,9 +122,9 @@ impl StdioTransport {
         let mut child = Command::new(&config.command)
             .args(&config.args)
             .envs(&config.env)
-            .stdin(std::process::Stdio::piped())
-            .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::inherit())
+            .stdin(ProcStdio::piped())
+            .stdout(ProcStdio::piped())
+            .stderr(ProcStdio::inherit())
             .kill_on_drop(true)
             .spawn()
             .with_context(|| format!("failed to spawn MCP server `{}`", config.name))?;
@@ -152,6 +158,9 @@ impl StdioTransport {
         let stdout_lines = BufReader::new(stdout).lines();
 
         Ok(Self {
+            spawn_cmd: config.command.clone(),
+            spawn_args: config.args.clone(),
+            spawn_env: config.env.clone(),
             _child: child,
             stdin,
             stdout_lines,
@@ -228,6 +237,63 @@ impl McpTransportConn for StdioTransport {
 
     async fn close(&mut self) -> Result<()> {
         let _ = self.stdin.shutdown().await;
+        // Kill the child process explicitly so the caller doesn't have to wait
+        // for Drop + kill_on_drop on an async drop boundary.
+        let _ = self._child.start_kill().ok();
+        Ok(())
+    }
+
+    /// Reset the stdio transport by killing the current child process and
+    /// spawning a fresh one. This handles the case where the child has
+    /// crashed or become unresponsive.
+    async fn reset(&mut self) -> Result<()> {
+        // 1. Shut down stdin (graceful shutdown signal).
+        let _ = self.stdin.shutdown().await;
+
+        // 2. Kill the child process.
+        if let Err(e) = self._child.start_kill() {
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                    .with_attrs(::serde_json::json!({"error": format!("{e}")})),
+                "mcp_transport: failed to send kill signal during stdio reset"
+            );
+        }
+        // Wait for the process to actually exit.
+        let _ = timeout(Duration::from_secs(10), self._child.wait()).await;
+
+        // 3. Re-spawn with the stored config parameters.
+        let mut child = Command::new(&self.spawn_cmd)
+            .args(&self.spawn_args)
+            .envs(&self.spawn_env)
+            .stdin(ProcStdio::piped())
+            .stdout(ProcStdio::piped())
+            .stderr(ProcStdio::inherit())
+            .kill_on_drop(true)
+            .spawn()
+            .with_context(|| {
+                format!(
+                    "failed to re-spawn MCP server `{}` during stdio reset",
+                    self.spawn_cmd
+                )
+            })?;
+
+        self.stdin = child.stdin.take().ok_or_else(|| {
+            anyhow::Error::msg("no stdin on re-spawned MCP server")
+        })?;
+        let stdout = child.stdout.take().ok_or_else(|| {
+            anyhow::Error::msg("no stdout on re-spawned MCP server")
+        })?;
+        self.stdout_lines = BufReader::new(stdout).lines();
+        self._child = child;
+
+        ::zeroclaw_log::record!(
+            DEBUG,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note),
+            "mcp_transport: stdio transport reset and re-spawned"
+        );
+
         Ok(())
     }
 }
