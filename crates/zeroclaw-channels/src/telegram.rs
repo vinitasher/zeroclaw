@@ -2,6 +2,7 @@ use anyhow::Context;
 use async_trait::async_trait;
 use parking_lot::{Mutex, RwLock};
 use reqwest::multipart::{Form, Part};
+use std::collections::HashMap;
 use std::fmt::Write as _;
 use std::path::Path;
 use std::sync::Arc;
@@ -43,6 +44,99 @@ const TELEGRAM_COMMAND_NAME_MAX_LEN: usize = 32;
 /// but empirical testing shows the API returns errors for descriptions substantially
 /// longer than 100 characters. This conservative cap avoids that in practice.
 const TELEGRAM_COMMAND_DESCRIPTION_MAX_LEN: usize = 100;
+
+/// Timeout for buffering Telegram media-group updates before flushing.
+/// Telegram sends all items of a media group within a short window;
+///
+/// larger than typical inter-arrival delays but small enough to avoid
+/// perceptible latency in the agent response.
+const MEDIA_GROUP_FLUSH_TIMEOUT_MS: u64 = 750;
+
+/// One item within a buffered media group, kept on disk pending the rest
+/// of the group.
+#[derive(Debug, Clone)]
+struct MediaGroupItem {
+    /// Pre-built content string for this item (includes [IMAGE:] or
+    /// [Document:] marker and the local path).
+    content: String,
+    /// Caption that belongs to this item's parent message (may be None).
+    caption: Option<String>,
+    /// Original Telegram message ID of this item.
+    message_id: i64,
+    /// Sender identity, extracted once at buffering time (same for all items
+    /// in a group but stored per-item so `build_media_group_message` can use it).
+    sender_identity: String,
+    /// Thread/message_thread_id of the originating message.
+    thread_id: Option<String>,
+}
+
+/// Accumulates items that share a `media_group_id` until the timeout fires
+/// or a non-group update is observed for the same chat.
+#[derive(Debug)]
+struct MediaGroupBuffer {
+    /// Key: format "{chat_id}:{media_group_id}".
+    groups: HashMap<String, Vec<MediaGroupItem>>,
+    /// Wall-clock instant when each group was first observed.
+    deadlines: HashMap<String, tokio::time::Instant>,
+}
+
+impl MediaGroupBuffer {
+    fn new() -> Self {
+        Self {
+            groups: HashMap::new(),
+            deadlines: HashMap::new(),
+        }
+    }
+
+    /// Record an item into a media group.  Returns the group key so the
+    /// caller can schedule a flush check.
+    fn push(&mut self, key: String, item: MediaGroupItem) {
+        let is_new = !self.groups.contains_key(&key);
+        let entry = self.groups.entry(key.clone()).or_insert_with(Vec::new);
+        entry.push(item);
+        if is_new {
+            self.deadlines
+                .insert(key, tokio::time::Instant::now() + Duration::from_millis(
+                    MEDIA_GROUP_FLUSH_TIMEOUT_MS,
+                ));
+        }
+    }
+
+    /// Return keys whose timeout has expired, in insertion order.
+    fn expired_groups(&self) -> Vec<String> {
+        let now = tokio::time::Instant::now();
+        let mut keys: Vec<String> = self
+            .groups
+            .keys()
+            .filter(|k| self.deadlines.get(*k).map_or(false, |d| *d <= now))
+            .cloned()
+            .collect();
+        keys.sort_by(|a, b| {
+            // Sort by deadline, then by key for determinism
+            self.deadlines
+                .get(a)
+                .unwrap()
+                .cmp(self.deadlines.get(b).unwrap())
+                .then_with(|| a.cmp(b))
+        });
+        keys
+    }
+
+    fn remove(&mut self, key: &str) {
+        self.groups.remove(key);
+        self.deadlines.remove(key);
+    }
+
+    fn is_empty(&self) -> bool {
+        self.groups.is_empty()
+    }
+}
+
+impl Default for MediaGroupBuffer {
+    fn default() -> Self {
+        Self::new()
+    }
+}
 
 /// Sanitize a skill name into a valid Telegram command name.
 /// Telegram commands must be 1-32 characters, lowercase a-z, 0-9, underscore only.
@@ -570,6 +664,10 @@ pub struct TelegramChannel {
     /// tool approval prompt before auto-denying. Configurable via
     /// `channels.telegram.approval_timeout_secs`. Default: 120.
     approval_timeout_secs: u64,
+    /// Buffers Telegram media-group items until the group is complete, then
+    /// emits one consolidated `ChannelMessage` per album instead of one per
+    /// attachment. Keyed by "chat_id:media_group_id". See #7873.
+    media_group_buffer: Arc<Mutex<MediaGroupBuffer>>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -629,6 +727,7 @@ impl TelegramChannel {
             tool_command_specs: Vec::new(),
             pending_approvals: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
             approval_timeout_secs: 120,
+            media_group_buffer: Arc::new(Mutex::new(MediaGroupBuffer::new())),
         }
     }
 
@@ -2053,6 +2152,84 @@ Allowlist Telegram username (without '@') or numeric user ID.",
             attachments: vec![],
             subject: None,
         })
+    }
+
+    /// Build one `ChannelMessage` from a completed media group.
+    ///
+    /// The caption comes from whichever item in `items` carries one (Telegram
+    /// sends the album's shared caption on the first item).  Attachment
+    /// markers are emitted in `message_id` order so the output is deterministic.
+    fn build_media_group_message(
+        &self,
+        chat_id: &str,
+        items: Vec<MediaGroupItem>,
+    ) -> ChannelMessage {
+        // Sort by message_id — Telegram assigns IDs in the order items were
+        // uploaded, which is the natural presentation order for the album.
+        let mut items = items;
+        items.sort_by_key(|i| i.message_id);
+
+        // The shared caption lives on the first item that has one.
+        let shared_caption = items
+            .iter()
+            .find_map(|i| i.caption.as_deref())
+            .filter(|c| !c.is_empty());
+
+        // Compose content: each item's content marker on its own line, then
+        // the shared caption if present.
+        let mut content = String::new();
+        for item in &items {
+            content.push_str(&item.content);
+            content.push('\n');
+        }
+
+        if let Some(caption) = shared_caption {
+            content.push_str("\n\n");
+            content.push_str(caption);
+        }
+
+        // thread_id and sender_identity come from the first item in the group
+        // (all items in a media group share the same sender and thread).
+        let thread_id = items.first().and_then(|i| i.thread_id.clone());
+        let sender_identity = items
+            .first()
+            .map(|i| i.sender_identity.clone())
+            .unwrap_or_else(|| "unknown".to_string());
+
+        let reply_target = thread_id
+            .as_ref()
+            .map(|tid| format!("{chat_id}:{tid}"))
+            .unwrap_or_else(|| chat_id.to_string());
+
+        // Use the smallest message_id in the group as the channel-message ID
+        // base so the ID is stable and deterministic.
+        let base_message_id = items.first().map(|i| i.message_id).unwrap_or(0);
+
+        ChannelMessage {
+            id: format!("telegram_{chat_id}_mg_{base_message_id}"),
+            sender: sender_identity,
+            reply_target,
+            content: content.trim_end().to_string(),
+            channel: "telegram".into(),
+            channel_alias: Some(self.alias.clone()),
+            timestamp: std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs(),
+            thread_ts: thread_id,
+            interruption_scope_id: None,
+            attachments: vec![],
+            subject: None,
+        }
+    }
+
+    /// Return the `media_group_id` of a Telegram update, if it has one.
+    fn media_group_id(update: &serde_json::Value) -> Option<String> {
+        update
+            .get("message")
+            .and_then(|m| m.get("media_group_id"))
+            .and_then(serde_json::Value::as_str)
+            .map(String::from)
     }
 
     /// Extract sender username and display identity from a Telegram message object.
@@ -3871,6 +4048,153 @@ Ensure only one `zeroclaw` process is using this bot token."
                         continue; // callback_query is not a regular message
                     }
 
+                    // ── Two-pass: collect media-group items first, then emit ──
+                    //
+                    // Telegram delivers every item in a media group in rapid succession.
+                    // We gather them into a buffer keyed by "chat_id:media_group_id",
+                    // flush each group when its timeout fires, and emit one consolidated
+                    // ChannelMessage per group.  Non-group updates are passed through
+                    // immediately.
+                    //
+                    // Pass 1 – accumulate
+                    if let Some(mg_id) = Self::media_group_id(update) {
+                        // Only buffer attachment updates; text messages within a media
+                        // group have no media_group_id in the Telegram API schema.
+                        if let Some(attachment) =
+                            Self::parse_attachment_metadata(update.get("message")?)
+                        {
+                            let message = update.get("message").unwrap();
+                            let chat_id = message
+                                .get("chat")
+                                .and_then(|chat| chat.get("id"))
+                                .and_then(serde_json::Value::as_i64)
+                                .map(|id| id.to_string())?;
+                            let message_id = message
+                                .get("message_id")
+                                .and_then(serde_json::Value::as_i64)
+                                .unwrap_or(0);
+                            let thread_id = message
+                                .get("message_thread_id")
+                                .and_then(serde_json::Value::as_i64)
+                                .map(|id| id.to_string());
+                            let group_key = format!("{chat_id}:{mg_id}");
+
+                            // Gate check before downloading
+                            let gated_caption =
+                                self.check_media_mention_gate(message, attachment.caption.as_deref())?;
+
+                            let (username, sender_id, sender_identity) =
+                                Self::extract_sender_info(message);
+                            let mut identities = vec![username.as_str()];
+                            if let Some(id) = sender_id.as_deref() {
+                                identities.push(id);
+                            }
+                            if !self.is_any_user_allowed(identities.iter().copied()) {
+                                continue;
+                            }
+
+                            // Resolve workspace dir
+                            let workspace = self.workspace_dir.as_ref()?;
+                            let save_dir = workspace.join("telegram_files");
+                            if tokio::fs::create_dir_all(&save_dir).await.is_err() {
+                                continue;
+                            }
+
+                            let tg_file_path = match self.get_file_path(&attachment.file_id).await {
+                                Ok(p) => p,
+                                Err(_) => continue,
+                            };
+                            let file_data = match self.download_file(&tg_file_path).await {
+                                Ok(d) => d,
+                                Err(_) => continue,
+                            };
+
+                            // Size check
+                            if let Some(size) = attachment.file_size
+                                && size > TELEGRAM_MAX_FILE_DOWNLOAD_BYTES
+                            {
+                                continue;
+                            }
+
+                            let local_filename = match &attachment.file_name {
+                                Some(name) => name.clone(),
+                                None => {
+                                    let ext =
+                                        tg_file_path.rsplit('.').next().unwrap_or("jpg");
+                                    format!("photo_{chat_id}_{message_id}.{ext}")
+                                }
+                            };
+                            let local_path = save_dir.join(&local_filename);
+                            if tokio::fs::write(&local_path, &file_data).await.is_err() {
+                                continue;
+                            }
+
+                            let content = format_attachment_content(
+                                attachment.kind,
+                                &local_filename,
+                                &local_path,
+                            );
+
+                            // Push into buffer
+                            let item = MediaGroupItem {
+                                content,
+                                caption: gated_caption,
+                                message_id,
+                                sender_identity: sender_identity.clone(),
+                                thread_id: thread_id.clone(),
+                            };
+                            self.media_group_buffer
+                                .lock()
+                                .push(group_key, item);
+                            continue; // wait for more items or timeout
+                        }
+                        // media_group_id with no attachment metadata → pass through to the
+                        // normal dispatch below (handles e.g. caption-only messages that
+                        // somehow carry a media_group_id, which Telegram does not normally
+                        // produce but we guard against).
+                    }
+
+                    // ── Pass 2 – flush any timed-out groups before processing this update ──
+                    let expired = self.media_group_buffer.lock().expired_groups();
+                    for key in expired {
+                        let (chat_id, _mg_id) = key.split_once(':').unwrap_or((&key, ""));
+                        let items: Vec<MediaGroupItem> = self
+                            .media_group_buffer
+                            .lock()
+                            .groups
+                            .remove(&key)
+                            .unwrap_or_default();
+
+                        if items.is_empty() {
+                            continue;
+                        }
+
+                        let msg = self.build_media_group_message(chat_id, items);
+
+                        if self.ack_reactions {
+                            self.try_add_ack_reaction_nonblocking(
+                                msg.reply_target.clone(),
+                                0, // media group — no single reaction target
+                            );
+                        }
+
+                        let typing_body = serde_json::json!({
+                            "chat_id": &msg.reply_target,
+                            "action": "typing"
+                        });
+                        let _ = self
+                            .http_client()
+                            .post(self.api_url("sendChatAction"))
+                            .json(&typing_body)
+                            .send()
+                            .await;
+
+                        if tx.send(msg).await.is_err() {
+                            return Ok(());
+                        }
+                    }
+
+                    // ── Handle non-group updates ──
                     let msg = if let Some(m) = self.parse_update_message(update) {
                         m
                     } else if let Some(m) = self.try_parse_voice_message(update).await {
@@ -7659,5 +7983,163 @@ mod tests {
     fn non_approval_callback_data_is_ignored() {
         let cb_data = "some_other_action:data";
         assert!(cb_data.strip_prefix("approval:").is_none());
+    }
+
+    // ── Media-group consolidation tests (#7873) ─────────────────────────────────
+
+    fn make_item(
+        message_id: i64,
+        caption: Option<&str>,
+        sender_identity: &str,
+        thread_id: Option<&str>,
+    ) -> MediaGroupItem {
+        MediaGroupItem {
+            content: format!("[IMAGE: photo_{message_id}.jpg]"),
+            caption: caption.map(String::from),
+            message_id,
+            sender_identity: sender_identity.to_string(),
+            thread_id: thread_id.map(String::from),
+        }
+    }
+
+    #[test]
+    fn build_media_group_message_consolidates_multiple_items() {
+        let ch = TelegramChannel::new(
+            "fake-token".into(),
+            "test",
+            Arc::new(|| vec!["*".into()]),
+            false,
+        );
+        let items = vec![
+            make_item(10, None, "alice", None),
+            make_item(11, Some("Look at these"), "alice", None),
+            make_item(12, None, "alice", None),
+        ];
+        let msg = ch.build_media_group_message("123", items);
+
+        // All three items appear as content markers
+        assert!(msg.content.contains("photo_10.jpg"));
+        assert!(msg.content.contains("photo_11.jpg"));
+        assert!(msg.content.contains("photo_12.jpg"));
+        // Shared caption is preserved
+        assert!(msg.content.contains("Look at these"));
+        // Sender from first item
+        assert_eq!(msg.sender, "alice");
+        // reply_target is just chat_id when no thread
+        assert_eq!(msg.reply_target, "123");
+    }
+
+    #[test]
+    fn build_media_group_message_orders_by_message_id() {
+        let ch = TelegramChannel::new(
+            "fake-token".into(),
+            "test",
+            Arc::new(|| vec!["*".into()]),
+            false,
+        );
+        // Items arrive out of order
+        let items = vec![
+            make_item(30, Some("third"), "bob", None),
+            make_item(10, Some("first"), "bob", None),
+            make_item(20, Some("second"), "bob", None),
+        ];
+        let msg = ch.build_media_group_message("-1001", items);
+
+        // Message IDs must appear in ascending order in the content string
+        let p10 = msg.content.find("photo_10").unwrap();
+        let p20 = msg.content.find("photo_20").unwrap();
+        let p30 = msg.content.find("photo_30").unwrap();
+        assert!(p10 < p20, "10 must precede 20");
+        assert!(p20 < p30, "20 must precede 30");
+    }
+
+    #[test]
+    fn build_media_group_message_uses_thread_id_from_first_item() {
+        let ch = TelegramChannel::new(
+            "fake-token".into(),
+            "test",
+            Arc::new(|| vec!["*".into()]),
+            false,
+        );
+        let items = vec![
+            make_item(1, None, "carol", Some("thread-42")),
+            make_item(2, None, "carol", Some("thread-42")),
+        ];
+        let msg = ch.build_media_group_message("999", items);
+
+        assert_eq!(msg.reply_target, "999:thread-42");
+        assert_eq!(msg.thread_ts.as_deref(), Some("thread-42"));
+    }
+
+    #[test]
+    fn build_media_group_message_id_is_deterministic() {
+        let ch = TelegramChannel::new(
+            "fake-token".into(),
+            "test",
+            Arc::new(|| vec!["*".into()]),
+            false,
+        );
+        let items1 = vec![make_item(5, None, "x", None), make_item(7, None, "x", None)];
+        let items2 = vec![make_item(7, None, "x", None), make_item(5, None, "x", None)];
+
+        let msg1 = ch.build_media_group_message("123", items1);
+        let msg2 = ch.build_media_group_message("123", items2);
+
+        // Both use the smallest message_id (5) as the base → same channel-message id
+        assert_eq!(msg1.id, msg2.id);
+    }
+
+    #[test]
+    fn build_media_group_message_empty_caption_not_included() {
+        let ch = TelegramChannel::new(
+            "fake-token".into(),
+            "test",
+            Arc::new(|| vec!["*".into()]),
+            false,
+        );
+        // All captions are empty strings — must NOT append extra newlines
+        let items = vec![
+            make_item(1, Some(""), "alice", None),
+            make_item(2, Some(""), "alice", None),
+        ];
+        let msg = ch.build_media_group_message("123", items);
+
+        // No trailing blank caption block
+        assert!(!msg.content.ends_with("\n\n"));
+        // Content ends with the last image marker
+        assert!(msg.content.trim_end().ends_with("photo_2.jpg"));
+    }
+
+    #[tokio::test]
+    async fn media_group_buffer_flushes_on_timeout() {
+        let buf = MediaGroupBuffer::new();
+        let key = "123:abc";
+        buf.lock().push(key.into(), make_item(1, None, "x", None));
+        // Advance well past the MEDIA_GROUP_FLUSH_TIMEOUT_MS (750ms) deadline.
+        // We manipulate the deadline directly to avoid a slow test.
+        buf.lock().deadlines.insert(
+            key.into(),
+            tokio::time::Instant::now() - std::time::Duration::from_millis(1),
+        );
+
+        let expired: Vec<_> = buf.lock().expired_groups();
+        assert!(
+            expired.contains(&key.to_string()),
+            "group must be expired when deadline is in the past"
+        );
+    }
+
+    #[test]
+    fn media_group_buffer_collects_multiple_items() {
+        let buf = MediaGroupBuffer::new();
+        let key = "456:mg1";
+        buf.lock().push(key.into(), make_item(1, None, "a", None));
+        buf.lock().push(key.into(), make_item(2, None, "a", None));
+        buf.lock().push(key.into(), make_item(3, None, "a", None));
+
+        let groups = &buf.lock().groups;
+        let group = groups.get(key);
+        assert!(group.is_some(), "group must exist");
+        assert_eq!(group.unwrap().len(), 3, "all 3 items must be buffered");
     }
 }
