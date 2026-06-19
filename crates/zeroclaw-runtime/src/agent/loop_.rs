@@ -1231,6 +1231,14 @@ pub async fn run(
                     );
                 }
             }
+            // Close the registry so its stdio child processes are reaped.
+            // Without this explicit close, dropping the registry's Arc inside
+            // a short-lived `agent::run` call (heartbeat tick) causes the child
+            // to leak: the Arc strong-count never reaches zero inside the
+            // `__zc_body` async block, so `kill_on_drop` never fires.
+            if let Some(ref registry) = mcp_registry_arc {
+                let _ = registry.close().await;
+            }
         }
 
         // ── Resolve model_provider ─────────────────────────────────────────

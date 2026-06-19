@@ -227,7 +227,17 @@ impl McpTransportConn for StdioTransport {
     }
 
     async fn close(&mut self) -> Result<()> {
+        // Drop stdin first to signal EOF to the child.
         let _ = self.stdin.shutdown().await;
+        // Drop stdout_lines so the BufReader/ChildStdout are dropped, which
+        // closes the child's stdout pipe.  Without this the read_loop (if any)
+        // hangs forever waiting for EOF and the Child struct is never dropped,
+        // so `kill_on_drop` never fires and the stdio child accumulates.
+        self.stdout_lines = tokio::io::Lines::new(tokio::io::BufReader::new(
+            tokio::process::ChildStdout::from_std(
+                std::process::Stdio::null().unwrap(),
+            )?,
+        ));
         Ok(())
     }
 }

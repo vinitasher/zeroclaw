@@ -181,6 +181,12 @@ impl McpServer {
         self.inner.lock().await.config.name.clone()
     }
 
+    /// Close the underlying transport, signalling EOF to the child process so
+    /// it exits and `kill_on_drop` fires.  Safe to call multiple times.
+    pub async fn close(&self) -> Result<()> {
+        self.inner.lock().await.transport.close().await
+    }
+
     /// Call a tool on this server. Returns the raw JSON result.
     pub async fn call_tool(
         &self,
@@ -431,6 +437,27 @@ impl McpRegistry {
 
     pub fn tool_count(&self) -> usize {
         self.tool_index.len()
+    }
+
+    /// Close all server transports, signalling EOF to each child process so it
+    /// exits and `kill_on_drop` fires.  Idempotent — safe to call multiple
+    /// times.  This is the mechanism that prevents stdio MCP child processes
+    /// from accumulating when a short-lived `McpRegistry` (created per
+    /// `agent::run` heartbeat tick) is dropped.
+    pub async fn close(&self) -> Result<()> {
+        let mut last_err = Ok(());
+        for server in &self.servers {
+            if let Err(e) = server.close().await {
+                last_err = Err(e);
+            }
+        }
+        last_err
+    }
+
+    /// Alias for [`close()`][McpRegistry::close] — provided for call sites that
+    /// prefer a distinct shutdown name.
+    pub async fn shutdown(&self) -> Result<()> {
+        self.close().await
     }
 }
 
