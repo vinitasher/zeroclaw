@@ -12875,6 +12875,23 @@ pub struct WhatsAppConfig {
     #[tab(Advanced)]
     #[serde(default)]
     pub group_mention_patterns: Vec<String>,
+    /// Group JID allowlist for WhatsApp Web (personal mode).
+    ///
+    /// When `mode = "personal"` and `group_policy = "allowlist"`, only
+    /// messages from groups whose JID appears in this list are processed.
+    /// Group JIDs have the form `<id>@g.us`. A single `"*"` entry allows
+    /// all groups (equivalent to `group_policy = "all"` for the group-JID
+    /// check). When empty, no groups are allowed via JID matching — the
+    /// sender's phone number is still checked via `allowed_numbers` /
+    /// `peer_groups` for the Allowlist policy.
+    ///
+    /// Example:
+    /// ```toml
+    /// allowed_groups = ["120363012345678901@g.us"]
+    /// ```
+    #[tab(Advanced)]
+    #[serde(default)]
+    pub allowed_groups: Vec<String>,
     /// Per-channel proxy URL (http, https, socks5, socks5h).
     /// Overrides the global `[proxy]` setting for this channel only.
     #[tab(Advanced)]

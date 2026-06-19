@@ -114,6 +114,10 @@ pub struct WhatsAppWebChannel {
     /// When non-empty, only group messages matching at least one pattern are
     /// processed; matched fragments are stripped from the forwarded content.
     group_mention_patterns: Arc<Vec<regex::Regex>>,
+    /// Group JID allowlist for personal mode.
+    /// When non-empty and group_policy is Allowlist, only these group JIDs
+    /// are allowed. A single `"*"` entry allows all groups.
+    allowed_groups: Vec<String>,
     /// Resolved channel workspace root used to bound outbound local media
     /// marker reads. The source of truth remains
     /// `Config::channel_workspace_dir("whatsapp.<alias>")`; this is the
@@ -143,6 +147,7 @@ impl WhatsAppWebChannel {
         let dm_policy = config.dm_policy.clone();
         let group_policy = config.group_policy.clone();
         let self_chat_mode = config.self_chat_mode;
+        let allowed_groups = config.allowed_groups.clone();
 
         // Seed bot_phone from pair_phone (digits only)
         let bot_phone = pair_phone
@@ -185,6 +190,7 @@ impl WhatsAppWebChannel {
             voice_chats: Arc::new(std::sync::Mutex::new(std::collections::HashSet::new())),
             dm_mention_patterns: Arc::new(Vec::new()),
             group_mention_patterns: Arc::new(Vec::new()),
+            allowed_groups,
             workspace_dir: None,
         }
     }
@@ -310,6 +316,22 @@ impl WhatsAppWebChannel {
                 _ => false,
             }
         })
+    }
+
+    /// Check whether a group JID is allowed by the `allowed_groups` list.
+    ///
+    /// When `allowed_groups` is empty, no groups are allowed (deny-all).
+    /// A single `"*"` entry permits all group JIDs.
+    /// Otherwise the group JID is checked against the list (exact string match).
+    #[cfg(feature = "whatsapp-web")]
+    fn is_group_allowed(allowed_groups: &[String], group_jid: &str) -> bool {
+        if allowed_groups.is_empty() {
+            return false;
+        }
+        if allowed_groups.iter().any(|entry| entry.trim() == "*") {
+            return true;
+        }
+        allowed_groups.iter().any(|entry| entry == group_jid)
     }
 
     /// Normalize a phone-like token to canonical E.164 (`+<digits>`).
@@ -1775,6 +1797,7 @@ impl Channel for WhatsAppWebChannel {
             let bot_lid_clone = self.bot_lid.clone();
             let wa_dm_mention_patterns = self.dm_mention_patterns.clone();
             let wa_group_mention_patterns = self.group_mention_patterns.clone();
+            let wa_allowed_groups = self.allowed_groups.clone();
 
             // whatsapp-rust 0.6: BotBuilder gained a 4th typestate slot for the
             // async runtime (oxidezap/whatsapp-rust#621). `with_runtime` is
@@ -1811,6 +1834,7 @@ impl Channel for WhatsAppWebChannel {
                     let bot_lid_inner = bot_lid_clone.clone();
                     let wa_dm_mention_patterns = wa_dm_mention_patterns.clone();
                     let wa_group_mention_patterns = wa_group_mention_patterns.clone();
+                    let wa_allowed_groups = wa_allowed_groups.clone();
                     async move {
                         // whatsapp-rust 0.6: event handlers receive `Arc<Event>`
                         // per PR #613, so we match against `&*event` to get a
@@ -1900,12 +1924,8 @@ impl Channel for WhatsAppWebChannel {
                                                 // allow unconditionally
                                             }
                                             zeroclaw_config::schema::WhatsAppChatPolicy::Allowlist => {
-                                                if normalized.is_none() {
-                                                    let lid_diag = Self::lid_rejection_diagnostic(
-                                                        &sender_jid,
-                                                        mapped_phone.as_deref(),
-                                                    );
-                                                    ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown), &format!("message from unrecognized sender not in allowed list (candidates_count={}){}", sender_candidates.len(), lid_diag));
+                                                if !Self::is_group_allowed(&wa_allowed_groups, &chat) {
+                                                    ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown), &format!("ignoring message from group {} (not in allowed_groups)", chat));
                                                     return;
                                                 }
                                             }
@@ -2674,6 +2694,73 @@ mod tests {
         assert!(WhatsAppWebChannel::is_number_allowed_for_list(
             &allowed,
             "+1 (555) 123-4567"
+        ));
+    }
+
+    // ── is_group_allowed ────────────────────────────────────
+
+    #[test]
+    #[cfg(feature = "whatsapp-web")]
+    fn group_allowed_exact_match() {
+        let groups = vec!["120363012345678901@g.us".to_string()];
+        assert!(WhatsAppWebChannel::is_group_allowed(
+            &groups,
+            "120363012345678901@g.us"
+        ));
+    }
+
+    #[test]
+    #[cfg(feature = "whatsapp-web")]
+    fn group_allowed_rejects_unknown() {
+        let groups = vec!["120363012345678901@g.us".to_string()];
+        assert!(!WhatsAppWebChannel::is_group_allowed(
+            &groups,
+            "120363099999999999@g.us"
+        ));
+    }
+
+    #[test]
+    #[cfg(feature = "whatsapp-web")]
+    fn group_allowed_wildcard_allows_any() {
+        let groups = vec!["*".to_string()];
+        assert!(WhatsAppWebChannel::is_group_allowed(
+            &groups,
+            "120363012345678901@g.us"
+        ));
+        assert!(WhatsAppWebChannel::is_group_allowed(
+            &groups,
+            "120363099999999999@g.us"
+        ));
+    }
+
+    #[test]
+    #[cfg(feature = "whatsapp-web")]
+    fn group_allowed_deny_all_when_empty() {
+        let groups: Vec<String> = vec![];
+        assert!(!WhatsAppWebChannel::is_group_allowed(
+            &groups,
+            "120363012345678901@g.us"
+        ));
+    }
+
+    #[test]
+    #[cfg(feature = "whatsapp-web")]
+    fn group_allowed_multiple_exact() {
+        let groups = vec![
+            "120363000000000001@g.us".to_string(),
+            "120363000000000002@g.us".to_string(),
+        ];
+        assert!(WhatsAppWebChannel::is_group_allowed(
+            &groups,
+            "120363000000000001@g.us"
+        ));
+        assert!(WhatsAppWebChannel::is_group_allowed(
+            &groups,
+            "120363000000000002@g.us"
+        ));
+        assert!(!WhatsAppWebChannel::is_group_allowed(
+            &groups,
+            "120363000000000003@g.us"
         ));
     }
 
