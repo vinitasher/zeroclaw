@@ -566,11 +566,7 @@ fn picker_items_for(
         }
         Section::Memory => PickerDispatch::Items(memory_picker(cfg)),
         Section::Channels => PickerDispatch::Items(schema_walk_picker(cfg, "channels")),
-        Section::Tunnel => PickerDispatch::Items(schema_walk_picker_with_none(
-            cfg,
-            "tunnel",
-            "tunnel.tunnel-provider",
-        )),
+        Section::Tunnel => PickerDispatch::Items(tunnel_picker(cfg)),
         Section::Agents => PickerDispatch::Items(agents_picker(cfg)),
         // Storage is two-tier (`storage.<kind>.<alias>`) — same shape
         // and walker as channels and the typed-provider families.
@@ -915,6 +911,67 @@ fn schema_walk_picker_with_none(
         }
     }
     items.extend(rest);
+    items
+}
+
+/// Tunnel picker: always enumerates every known tunnel provider (cloudflare,
+/// tailscale, ngrok, openvpn, pinggy, custom) regardless of whether the
+/// corresponding `Option<T>` subsection is populated in the config.
+///
+/// The `schema_walk_picker` machinery walks `prop_fields()` looking for
+/// `HashMap<String, T>` entries — it finds nothing for `Option<T>` fields on a
+/// fresh config where all options are `None`. Tunnel providers are a closed
+/// set encoded as `Option<T>` fields, so we enumerate them directly from the
+/// schema's `nested_option_entries` rather than relying on the generic walk.
+fn tunnel_picker(cfg: &zeroclaw_config::schema::Config) -> Vec<PickerItem> {
+    let active = cfg.tunnel.tunnel_provider.clone();
+
+    let mut items = vec![PickerItem {
+        key: "none".to_string(),
+        label: "none".to_string(),
+        description: Some("Localhost only — no public tunnel.".to_string()),
+        badge: if active == "none" || active.is_empty() {
+            Some("active".to_string())
+        } else {
+            None
+        },
+    }];
+
+    let providers = [
+        ("cloudflare", "Cloudflare Tunnel", "Zero Trust account + token required."),
+        ("tailscale", "Tailscale Funnel", "Tailnet account required; no separate token."),
+        ("ngrok", "ngrok", "Auth token required; generous free tier."),
+        ("openvpn", "OpenVPN", "Bring-your-own VPN server and client config."),
+        ("pinggy", "Pinggy", "SSH-based reverse tunnel; no account needed."),
+        ("custom", "Custom command", "Run any tunnel program you define under [tunnel.custom]."),
+    ];
+
+    for (key, label, description) in providers {
+        let badge = if active == key {
+            Some("active".to_string())
+        } else {
+            // Mark as "configured" when the corresponding Option is Some
+            // (i.e. the operator has already filled in credentials for it).
+            cfg.tunnel.nested_option_entries()
+                .iter()
+                .find(|e| e.field == key)
+                .map(|e| {
+                    if e.present {
+                        Some("configured".to_string())
+                    } else {
+                        None
+                    }
+                })
+                .flatten()
+        };
+        items.push(PickerItem {
+            key: key.to_string(),
+            label: label.to_string(),
+            description: Some(description.to_string()),
+            badge,
+        });
+    }
+
     items
 }
 
@@ -1590,6 +1647,65 @@ mod tests {
         );
         // `none` is the active default for a fresh config.
         assert_eq!(items[0].badge.as_deref(), Some("active"));
+    }
+
+    /// Regression test for GitHub #7876: tunnel picker must show all known
+    /// providers even on a fresh config where every `Option<T>` subsection
+    /// is `None`. The old `schema_walk_picker`-based implementation only found
+    /// entries by walking `prop_fields()` for `HashMap<String, T>` entries,
+    /// so `Option<T>` fields (which start as `None`) were invisible until the
+    /// operator explicitly populated them.
+    #[test]
+    fn tunnel_picker_shows_all_providers_on_fresh_config() {
+        let cfg = empty_cfg();
+        let items = tunnel_picker(&cfg);
+        let keys: Vec<_> = items.iter().map(|i| i.key.as_str()).collect();
+        assert!(
+            keys.contains(&"cloudflare"),
+            "cloudflare must be visible on a fresh config; got: {keys:?}"
+        );
+        assert!(
+            keys.contains(&"tailscale"),
+            "tailscale must be visible on a fresh config; got: {keys:?}"
+        );
+        assert!(
+            keys.contains(&"ngrok"),
+            "ngrok must be visible on a fresh config; got: {keys:?}"
+        );
+        assert!(
+            keys.contains(&"openvpn"),
+            "openvpn must be visible on a fresh config; got: {keys:?}"
+        );
+        assert!(
+            keys.contains(&"pinggy"),
+            "pinggy must be visible on a fresh config; got: {keys:?}"
+        );
+        assert!(
+            keys.contains(&"custom"),
+            "custom must be visible on a fresh config; got: {keys:?}"
+        );
+        // none is active on a fresh config.
+        assert_eq!(
+            items.first().map(|i| i.badge.as_deref()),
+            Some(Some("active")),
+            "none should be marked active on a fresh config"
+        );
+    }
+
+    /// `tunnel_picker` marks a provider as "configured" when its `Option<T>`
+    /// subsection is populated (i.e. the operator has filled in credentials).
+    #[test]
+    fn tunnel_picker_marks_configured_provider() {
+        let mut cfg = empty_cfg();
+        // Simulate the operator having configured cloudflare credentials.
+        cfg.tunnel.cloudflare = Some(Default::default());
+        let items = tunnel_picker(&cfg);
+        let cloudflare = items.iter().find(|i| i.key == "cloudflare").unwrap();
+        assert_eq!(
+            cloudflare.badge.as_deref(),
+            Some("configured"),
+            "cloudflare should be marked configured after its Option is Some"
+        );
     }
 
     /// Empty OneTierAliasMap section yields zero picker items. No
