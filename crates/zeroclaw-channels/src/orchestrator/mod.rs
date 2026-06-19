@@ -5706,6 +5706,42 @@ fn one_shot_channel_workspace_dir(config: &Config, channel_type: &str, alias: &s
     config.channel_workspace_dir(&format!("{channel_type}.{alias}"))
 }
 
+/// Build an on-demand resolver for voice-preference peers.
+///
+/// Returns a closure that reads `[peer_groups.*]` entries whose channel
+/// matches `channel_type` (or `"<channel_type>.<alias>"`) and whose
+/// `output_modality` is `Voice`. The resolver is called at each
+/// `is_voice_chat` check, ensuring no config state is cached on the
+/// channel handle (SSOT: AGENTS.md "ABSOLUTE RULE").
+fn voice_peer_resolver_for_channel(
+    config_arc: Arc<RwLock<Config>>,
+    channel_type: &'static str,
+    alias: &str,
+) -> Arc<dyn Fn() -> Vec<String> + Send + Sync> {
+    use zeroclaw_config::multi_agent::OutputModality;
+    let alias = alias.to_string();
+    Arc::new(move || {
+        let cfg = config_arc.read();
+        let mut out: Vec<String> = Vec::new();
+        let mut seen = std::collections::HashSet::new();
+        for group in cfg.peer_groups.values() {
+            let group_matches = match group.channel.split_once('.') {
+                Some((ty, al)) => ty == channel_type && al == alias,
+                None => group.channel == channel_type,
+            };
+            if group_matches && group.output_modality == OutputModality::Voice {
+                for peer in &group.external_peers {
+                    let username = peer.as_str().to_string();
+                    if seen.insert(username.clone()) {
+                        out.push(username);
+                    }
+                }
+            }
+        }
+        out
+    })
+}
+
 /// Build a single channel instance by config section name (e.g. "telegram").
 fn build_channel_by_id(
     config_arc: &Arc<RwLock<Config>>,
@@ -5742,7 +5778,11 @@ fn build_channel_by_id(
                 .with_streaming(tg.stream_mode, tg.draft_update_interval_ms)
                 .with_transcription(config.transcription.clone())
                 .with_tts(&config)
-                .with_voice_peer_prefs(&config, "telegram", alias)
+                .with_voice_peer_resolver(voice_peer_resolver_for_channel(
+                    config_arc.clone(),
+                    "telegram",
+                    &alias,
+                ))
                 .with_workspace_dir(workspace_dir)
                 .with_approval_timeout_secs(tg.approval_timeout_secs),
             ))
@@ -6752,7 +6792,11 @@ fn collect_configured_channels(
                     .with_streaming(tg.stream_mode, tg.draft_update_interval_ms)
                     .with_transcription(config.transcription.clone())
                     .with_tts(&config)
-                    .with_voice_peer_prefs(&config, "telegram", alias)
+                    .with_voice_peer_resolver(voice_peer_resolver_for_channel(
+                        config_arc.clone(),
+                        "telegram",
+                        &alias,
+                    ))
                     .with_workspace_dir(config.channel_workspace_dir(&format!("telegram.{alias}")))
                     .with_proxy_url(tg.proxy_url.clone())
                     .with_tool_command_specs(tool_specs.to_vec())

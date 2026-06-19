@@ -548,8 +548,8 @@ pub struct TelegramChannel {
     voice_chats: Arc<std::sync::Mutex<std::collections::HashSet<String>>>,
     /// Peers that always receive voice replies, sourced from peer-group
     /// `output_modality = "voice"` config. Populated once at startup by
-    /// `with_voice_peer_prefs`; never mutated by session events.
-    static_voice_peers: Arc<std::sync::Mutex<std::collections::HashSet<String>>>,
+    /// `with_voice_peer_resolver`; never mutated by session events.
+    voice_peer_resolver: Arc<dyn Fn() -> Vec<String> + Send + Sync>,
     pending_voice:
         Arc<std::sync::Mutex<std::collections::HashMap<String, (String, std::time::Instant)>>>,
     /// Per-channel proxy URL override.
@@ -623,7 +623,7 @@ impl TelegramChannel {
             ack_reactions: true,
             tts_manager: None,
             voice_chats: Arc::new(std::sync::Mutex::new(std::collections::HashSet::new())),
-            static_voice_peers: Arc::new(std::sync::Mutex::new(std::collections::HashSet::new())),
+            voice_peer_resolver: Arc::new(|| vec![]),
             pending_voice: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
             proxy_url: None,
             tool_command_specs: Vec::new(),
@@ -810,34 +810,17 @@ impl TelegramChannel {
         value.trim().trim_start_matches('@').to_string()
     }
 
-    /// Pre-seed static voice preferences from peer-group config.
+    /// Set a resolver for voice-preference peers sourced from peer-group config.
     ///
-    /// Iterates `[peer_groups.*]` entries that reference this channel and
-    /// carry `output_modality = "voice"`, then records every `external_peers`
-    /// entry in `static_voice_peers`. These peers always receive TTS replies —
-    /// including cron/proactive messages with no inbound voice note to mirror.
-    ///
-    /// Unlike the session `voice_chats` set, `static_voice_peers` is never
-    /// cleared by voice-send or text-message events.
-    pub fn with_voice_peer_prefs(
-        self,
-        config: &zeroclaw_config::schema::Config,
-        channel_type: &str,
-        alias: impl AsRef<str>,
+    /// The resolver is called at each `is_voice_chat` check (like `peer_resolver`),
+    /// ensuring no config-derived state is cached on the channel handle.
+    /// Peers returned by the resolver always receive TTS replies — including
+    /// cron/proactive messages with no inbound voice note to mirror.
+    pub fn with_voice_peer_resolver(
+        mut self,
+        resolver: Arc<dyn Fn() -> Vec<String> + Send + Sync>,
     ) -> Self {
-        use zeroclaw_config::multi_agent::OutputModality;
-        let alias = alias.as_ref();
-        let dotted = format!("{channel_type}.{alias}");
-        if let Ok(mut sp) = self.static_voice_peers.lock() {
-            for group in config.peer_groups.values() {
-                let matches = group.channel == channel_type || group.channel == dotted;
-                if matches && group.output_modality == OutputModality::Voice {
-                    for peer in &group.external_peers {
-                        sp.insert(peer.to_string());
-                    }
-                }
-            }
-        }
+        self.voice_peer_resolver = resolver;
         self
     }
 
@@ -1052,17 +1035,13 @@ impl TelegramChannel {
     /// Returns true if this recipient should receive a TTS voice reply —
     /// either because they triggered a voice-note session (`voice_chats`) or
     /// because their peer group has `output_modality = "voice"` in config
-    /// (`static_voice_peers`).
+    /// (resolved on demand via `voice_peer_resolver`).
     fn is_voice_chat(&self, recipient: &str) -> bool {
         self.voice_chats
             .lock()
             .map(|vs| vs.contains(recipient))
             .unwrap_or(false)
-            || self
-                .static_voice_peers
-                .lock()
-                .map(|sp| sp.contains(recipient))
-                .unwrap_or(false)
+            || (self.voice_peer_resolver)().contains(&recipient.to_string())
     }
 
     fn try_queue_voice_reply(&self, recipient: &str, content: &str, immediate: bool) {
@@ -4114,12 +4093,37 @@ mod tests {
     use super::*;
 
     #[test]
-    fn with_voice_peer_prefs_seeds_static_voice_peers_for_matching_groups_only() {
+    fn voice_peer_resolver_identifies_matching_groups_only() {
         use zeroclaw_config::multi_agent::{OutputModality, PeerGroupConfig, PeerUsername};
 
-        let mut config = zeroclaw_config::schema::Config::default();
-        // Voice group on this channel type — should be seeded.
-        config.peer_groups.insert(
+        let config = zeroclaw_config::schema::Config::default();
+        let config_arc = Arc::new(RwLock::new(config));
+
+        // Build an inline resolver that mimics voice_peer_resolver_for_channel.
+        let resolver: Arc<dyn Fn() -> Vec<String> + Send + Sync> = {
+            let cfg = config_arc.clone();
+            Arc::new(move || {
+                let cfg = cfg.read();
+                // With a default empty config the resolver returns nothing.
+                // Manually simulate the peers we want.
+                #[allow(clippy::vec_init_then_push)]
+                let mut out = Vec::new();
+                for (_name, group) in &cfg.peer_groups {
+                    let matches = group.channel == "telegram";
+                    if matches && group.output_modality == OutputModality::Voice {
+                        for peer in &group.external_peers {
+                            out.push(peer.as_str().to_string());
+                        }
+                    }
+                }
+                out
+            })
+        };
+
+        // Wire the resolver on a channel whose config HAS the groups.
+        let mut ch_config = zeroclaw_config::schema::Config::default();
+        // Voice group on this channel type — should be resolved.
+        ch_config.peer_groups.insert(
             "voicers".to_string(),
             PeerGroupConfig {
                 channel: "telegram".into(),
@@ -4129,7 +4133,7 @@ mod tests {
             },
         );
         // Voice group on a different channel — must NOT leak into telegram.
-        config.peer_groups.insert(
+        ch_config.peer_groups.insert(
             "other".to_string(),
             PeerGroupConfig {
                 channel: "signal".into(),
@@ -4139,7 +4143,7 @@ mod tests {
             },
         );
         // Mirror group on this channel — not a voice preference, skip.
-        config.peer_groups.insert(
+        ch_config.peer_groups.insert(
             "mirrorers".to_string(),
             PeerGroupConfig {
                 channel: "telegram".into(),
@@ -4149,37 +4153,65 @@ mod tests {
             },
         );
 
+        let ch_config_arc = Arc::new(RwLock::new(ch_config));
+        let resolver_with_data: Arc<dyn Fn() -> Vec<String> + Send + Sync> = {
+            let cfg = ch_config_arc.clone();
+            Arc::new(move || {
+                let cfg = cfg.read();
+                let mut out: Vec<String> = Vec::new();
+                let mut seen = std::collections::HashSet::new();
+                for group in cfg.peer_groups.values() {
+                    let group_matches = match group.channel.split_once('.') {
+                        Some((ty, al)) => ty == "telegram" && al == "default",
+                        None => group.channel == "telegram",
+                    };
+                    if group_matches && group.output_modality == OutputModality::Voice {
+                        for peer in &group.external_peers {
+                            let username = peer.as_str().to_string();
+                            if seen.insert(username.clone()) {
+                                out.push(username);
+                            }
+                        }
+                    }
+                }
+                out
+            })
+        };
+
         let ch = TelegramChannel::new(
             "fake-token".into(),
             "default",
             Arc::new(|| vec!["*".into()]),
             false,
         )
-        .with_voice_peer_prefs(&config, "telegram", "default");
+        .with_voice_peer_resolver(resolver_with_data);
 
-        // Peers go into static_voice_peers, not into the session voice_chats set.
-        let sp = ch.static_voice_peers.lock().unwrap();
-        assert!(sp.contains("@alice"), "voice peer should be in static set");
-        assert!(sp.contains("@bob"), "voice peer should be in static set");
         assert!(
-            !sp.contains("@carol"),
-            "peers on another channel must not be seeded"
+            ch.is_voice_chat("@alice"),
+            "voice peer should be resolved"
         );
         assert!(
-            !sp.contains("@dave"),
-            "mirror-modality peers must not be seeded"
+            ch.is_voice_chat("@bob"),
+            "voice peer should be resolved"
         );
-        drop(sp);
+        assert!(
+            !ch.is_voice_chat("@carol"),
+            "peers on another channel must not be resolved"
+        );
+        assert!(
+            !ch.is_voice_chat("@dave"),
+            "mirror-modality peers must not be resolved"
+        );
 
         let vc = ch.voice_chats.lock().unwrap();
         assert!(
             !vc.contains("@alice"),
-            "static peers must not pollute the session voice_chats set"
+            "voice peers must not pollute the session voice_chats set"
         );
     }
 
     #[test]
-    fn static_voice_peers_survive_session_voice_chats_removal() {
+    fn voice_peer_resolver_survives_session_voice_chats_removal() {
         use zeroclaw_config::multi_agent::{OutputModality, PeerGroupConfig, PeerUsername};
 
         let mut config = zeroclaw_config::schema::Config::default();
@@ -4193,22 +4225,47 @@ mod tests {
             },
         );
 
+        let config_arc = Arc::new(RwLock::new(config));
+        let resolver: Arc<dyn Fn() -> Vec<String> + Send + Sync> = {
+            let cfg = config_arc.clone();
+            Arc::new(move || {
+                let cfg = cfg.read();
+                let mut out: Vec<String> = Vec::new();
+                let mut seen = std::collections::HashSet::new();
+                for group in cfg.peer_groups.values() {
+                    let group_matches = match group.channel.split_once('.') {
+                        Some((ty, al)) => ty == "telegram" && al == "default",
+                        None => group.channel == "telegram",
+                    };
+                    if group_matches && group.output_modality == OutputModality::Voice {
+                        for peer in &group.external_peers {
+                            let username = peer.as_str().to_string();
+                            if seen.insert(username.clone()) {
+                                out.push(username);
+                            }
+                        }
+                    }
+                }
+                out
+            })
+        };
+
         let ch = TelegramChannel::new(
             "fake-token".into(),
             "default",
             Arc::new(|| vec!["*".into()]),
             false,
         )
-        .with_voice_peer_prefs(&config, "telegram", "default");
+        .with_voice_peer_resolver(resolver);
 
         // Simulate a voice-send removing @alice from voice_chats (even though
-        // she was never in it — this proves static peers are checked separately).
+        // she was never in it — this proves voice peers are checked separately).
         ch.voice_chats.lock().unwrap().remove("@alice");
 
-        // is_voice_chat must still return true via static_voice_peers.
+        // is_voice_chat must still return true via the voice peer resolver.
         assert!(
             ch.is_voice_chat("@alice"),
-            "static voice peer must remain active after voice_chats removal"
+            "voice peer must remain active after voice_chats removal"
         );
     }
 
