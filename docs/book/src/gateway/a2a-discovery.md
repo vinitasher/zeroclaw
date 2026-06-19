@@ -164,6 +164,11 @@ Now you know three things. The agent is named `agent_alpha`. It has three skills
 of what each does. And the single `JSONRPC` interface URL,
 `http://localhost:42617/a2a/agent_alpha`, is the address you POST a task to.
 
+The card `description` comes from the alias identity document when one is
+configured: an AIEOS identity's bio supplies the line, falling back to a name
+from that identity. When no identity is set, the card uses the neutral default
+`ZeroClaw agent '<alias>'.` shown above.
+
 ## What an agent chooses to show
 
 An agent does not have to publish every skill it has. The `agent_beta` agent in

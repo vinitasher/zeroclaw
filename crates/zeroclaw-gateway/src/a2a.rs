@@ -198,7 +198,7 @@ pub fn build_agent_card(config: &Config, alias: &str) -> Option<AgentCard> {
 
     AgentCard {
         name: alias.to_string(),
-        description: agent_description(alias),
+        description: agent_description(config, alias),
         supported_interfaces: vec![AgentInterface {
             url: endpoint,
             protocol_binding: A2A_PROTOCOL_BINDING.to_string(),
@@ -229,10 +229,52 @@ fn published_aliases(config: &Config) -> Vec<String> {
     out
 }
 
-/// One-line agent description for the card. Neutral per-alias default; a
-/// richer source (identity document first line) can supersede this later.
-fn agent_description(alias: &str) -> String {
+/// One-line agent description for the card. Prefers the alias identity
+/// document (AIEOS `identity.bio`, falling back to a name line) so an
+/// operator-authored identity supersedes the neutral default. Falls back to
+/// `ZeroClaw agent '<alias>'.` when no identity is configured or it fails to
+/// load. The result is collapsed to a single line.
+fn agent_description(config: &Config, alias: &str) -> String {
+    if let Some(desc) = identity_description(config, alias) {
+        return desc;
+    }
     format!("ZeroClaw agent '{alias}'.")
+}
+
+/// Resolve a one-line description from the alias identity document, or `None`
+/// when there is no usable line. Reuses the runtime AIEOS loader so the
+/// gateway and the agent system prompt read identity through the same path.
+fn identity_description(config: &Config, alias: &str) -> Option<String> {
+    let agent = config.agents.get(alias)?;
+    let workspace_dir = config.agent_workspace_dir(alias);
+    let aieos = zeroclaw_runtime::identity::load_aieos_identity(&agent.identity, &workspace_dir)
+        .ok()
+        .flatten()?;
+    let identity = aieos.identity?;
+    let line = identity
+        .bio
+        .filter(|b| !b.trim().is_empty())
+        .or_else(|| identity.names.and_then(identity_name_line))?;
+    let collapsed = line.split_whitespace().collect::<Vec<_>>().join(" ");
+    (!collapsed.is_empty()).then_some(collapsed)
+}
+
+/// Build a name line from identity `names`, preferring the fullest form.
+fn identity_name_line(names: zeroclaw_runtime::identity::Names) -> Option<String> {
+    if let Some(full) = names.full.filter(|s| !s.trim().is_empty()) {
+        return Some(full);
+    }
+    let joined = [names.first, names.last]
+        .into_iter()
+        .flatten()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .collect::<Vec<_>>()
+        .join(" ");
+    if !joined.is_empty() {
+        return Some(joined);
+    }
+    names.nickname.filter(|s| !s.trim().is_empty())
 }
 
 /// Resolve the alias's exposed skills: the resolved bundle skill set narrowed
@@ -819,5 +861,54 @@ mod tests {
         assert_eq!(err["id"], 7);
         assert_eq!(err["error"]["code"], -32601);
         assert_eq!(err["error"]["message"], "Method not found");
+    }
+
+    #[test]
+    fn card_description_falls_back_to_neutral_default_without_identity() {
+        let config = config_with_published_alias("researcher", true);
+        let card = build_agent_card(&config, "researcher").expect("card");
+        assert_eq!(card.description, "ZeroClaw agent 'researcher'.");
+    }
+
+    #[test]
+    fn card_description_reads_identity_bio_when_configured() {
+        let tmp = tempfile::tempdir().expect("tmp");
+        std::fs::write(
+            tmp.path().join("identity.json"),
+            r#"{ "identity": { "names": { "first": "Nova" }, "bio": "Curates research and cites sources." } }"#,
+        )
+        .expect("write identity");
+
+        let mut config = config_with_published_alias("researcher", true);
+        {
+            let agent = config.agents.get_mut("researcher").unwrap();
+            agent.workspace.path = Some(tmp.path().to_path_buf());
+            agent.identity.format = "aieos".to_string();
+            agent.identity.aieos_path = Some("identity.json".to_string());
+        }
+
+        let card = build_agent_card(&config, "researcher").expect("card");
+        assert_eq!(card.description, "Curates research and cites sources.");
+    }
+
+    #[test]
+    fn card_description_uses_name_line_when_bio_absent() {
+        let tmp = tempfile::tempdir().expect("tmp");
+        std::fs::write(
+            tmp.path().join("identity.json"),
+            r#"{ "identity": { "names": { "full": "Nova the Researcher" } } }"#,
+        )
+        .expect("write identity");
+
+        let mut config = config_with_published_alias("researcher", true);
+        {
+            let agent = config.agents.get_mut("researcher").unwrap();
+            agent.workspace.path = Some(tmp.path().to_path_buf());
+            agent.identity.format = "aieos".to_string();
+            agent.identity.aieos_path = Some("identity.json".to_string());
+        }
+
+        let card = build_agent_card(&config, "researcher").expect("card");
+        assert_eq!(card.description, "Nova the Researcher");
     }
 }
