@@ -202,10 +202,17 @@ pub fn execute(input: String) -> FnResult<String> {
     };
 
     if resp.status >= 400 {
+        // Truncate error body at a UTF-8 char boundary to avoid panic on
+        // multi-byte content (see #7828).
+        let max_err_bytes = resp.body.len().min(500);
+        let trunc_end = (0..=max_err_bytes)
+            .rev()
+            .find(|&i| resp.body.is_char_boundary(i))
+            .unwrap_or(0);
         return Ok(serde_json::to_string(&ToolResult::failure(format!(
             "fal.ai API error ({}): {}",
             resp.status,
-            &resp.body[..resp.body.len().min(500)]
+            &resp.body[..trunc_end]
         )))?);
     }
 

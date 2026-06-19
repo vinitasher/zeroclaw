@@ -153,25 +153,38 @@ async fn compare_recall_quality() {
         println!("  Query: \"{query}\" — {desc}");
         println!("    SQLite:   {} results", sq_results.len());
         for r in &sq_results {
+            // Safely truncate at a UTF-8 char boundary to avoid panic with
+            // non-ASCII content (see #7828).
+            let preview = truncate_at_char_boundary(&r.content, 50);
             println!(
                 "      [{:.2}] {}: {}",
                 r.score.unwrap_or(0.0),
                 r.key,
-                &r.content[..r.content.len().min(50)]
+                preview
             );
         }
         println!("    Markdown: {} results", md_results.len());
         for r in &md_results {
+            let preview = truncate_at_char_boundary(&r.content, 50);
             println!(
                 "      [{:.2}] {}: {}",
                 r.score.unwrap_or(0.0),
                 r.key,
-                &r.content[..r.content.len().min(50)]
+                preview
             );
         }
         println!();
     }
 }
+
+/// Truncate `s` to at most `max` bytes, stepping back to a valid UTF-8
+/// char boundary so the returned slice never panics in `s[..i]`.
+fn truncate_at_char_boundary(s: &str, max: usize) -> &str {
+    let mut end = s.len().min(max);
+    while end > 0 && !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    &s[..end]
 
 // ── Test 3: Recall speed at scale ──────────────────────────────
 

@@ -858,17 +858,22 @@ pub fn scrub_secret_patterns(input: &str) -> String {
 }
 
 /// Sanitize API error text by scrubbing secrets and truncating length.
+/// Truncation operates on Unicode character count to respect the
+/// `MAX_API_ERROR_CHARS` limit, with a UTF-8 char-boundary-safe slice.
 pub fn sanitize_api_error(input: &str) -> String {
     let scrubbed = scrub_secret_patterns(input);
 
+    // Fast path: short enough as-is.
     if scrubbed.chars().count() <= MAX_API_ERROR_CHARS {
         return scrubbed;
     }
 
-    let mut end = MAX_API_ERROR_CHARS;
-    while end > 0 && !scrubbed.is_char_boundary(end) {
-        end -= 1;
-    }
+    // Truncate to MAX_API_ERROR_CHARS Unicode characters using char_indices
+    // so the byte slice is guaranteed to land on a valid char boundary.
+    let (end, _) = scrubbed
+        .char_indices()
+        .nth(MAX_API_ERROR_CHARS)
+        .unwrap_or((scrubbed.len(), '\0'));
 
     format!("{}...", &scrubbed[..end])
 }
@@ -1238,7 +1243,17 @@ fn create_model_provider_inner(
             && !has_custom_url
             && let Some(likely_model_provider) = check_api_key_prefix(provider_kind, key_value)
         {
-            let visible = &key_value[..key_value.len().min(8)];
+            // Walk back from byte 8 to a valid UTF-8 char boundary so that
+            // multi-byte characters in the prefix (extremely unlikely for API
+            // keys, but tracked in #7828) do not panic at the slice point.
+            let display_end = {
+                let mut i = key_value.len().min(8);
+                while i > 0 && !key_value.is_char_boundary(i) {
+                    i -= 1;
+                }
+                i
+            };
+            let visible = &key_value[..display_end];
             anyhow::bail!(
                 "API key prefix mismatch: key \"{visible}...\" looks like a \
                      {likely_model_provider} key, but model_provider \"{provider_kind}\" is selected. \
@@ -4264,5 +4279,173 @@ mod tests {
             result.is_ok(),
             "a deep acyclic chain must be depth-capped, never overflow or abort the build"
         );
+    }
+
+    // ── UTF-8 safe truncation tests ────────────────────────────────────
+    //
+    // Every byte-level truncation in the codebase must split on a UTF-8
+    // boundary so that no multi-byte character is cut in half.
+
+    #[test]
+    fn truncate_str_ascii() {
+        let s = "Hello, World!";
+        // Short enough — no truncation.
+        assert_eq!(truncate_str(s, 100), "Hello, World!");
+        // Exact boundary.
+        assert_eq!(truncate_str(s, 5), "Hello");
+        // Beyond end.
+        assert_eq!(truncate_str(s, 13), "Hello, World!");
+    }
+
+    #[test]
+    fn truncate_str_empty() {
+        assert_eq!(truncate_str("", 0), "");
+        assert_eq!(truncate_str("", 10), "");
+    }
+
+    #[test]
+    fn truncate_str_zero_max() {
+        assert_eq!(truncate_str("anything", 0), "");
+    }
+
+    #[test]
+    fn truncate_str_emoji_cut_before_multi_byte_boundary() {
+        // 🚀 is 4 bytes, 🌍 is 4 bytes.
+        // If we truncate to 5 bytes, naive code would cut inside 🚀.
+        // Safe truncation should end at byte 4 (just after 🚀).
+        assert_eq!(truncate_str("🚀🌍", 4), "🚀");
+        assert_eq!(truncate_str("🚀🌍", 5), "🚀");
+        assert_eq!(truncate_str("🚀🌍", 6), "🚀");
+        assert_eq!(truncate_str("🚀🌍", 7), "🚀");
+        assert_eq!(truncate_str("🚀🌍", 8), "🚀🌍");
+    }
+
+    #[test]
+    fn truncate_str_mixed_ascii_and_emoji() {
+        // "ab🚀cd" — 4-byte rocket between 2 ASCII chars on each side.
+        let s = "ab🚀cd";
+        assert_eq!(truncate_str(s, 2), "ab");
+        assert_eq!(truncate_str(s, 3), "ab");
+        assert_eq!(truncate_str(s, 6), "ab🚀");
+        assert_eq!(truncate_str(s, 7), "ab🚀c");
+        assert_eq!(truncate_str(s, 8), "ab🚀cd");
+    }
+
+    #[test]
+    fn truncate_str_multi_code_point_emoji() {
+        // A complex emoji sequence that is more than one codepoint.
+        // The woman-surfing sequence: U+1F3C4 U+200D U+2640 U+FE0F — 11 bytes total.
+        // Man-surfing: U+1F3C4 U+200D U+2642 U+FE0F — also 11 bytes.
+        let surfer = "\u{1f3c4}\u{200d}\u{2640}\u{fe0f}";
+        let s = format!("{surfer}{surfer}");
+        // Truncating to 11 bytes should yield exactly one surfer.
+        assert_eq!(truncate_str(&s, 11), surfer);
+        // Truncating to 10 bytes should yield nothing (no partial multi-byte).
+        assert_eq!(truncate_str(&s, 10), "");
+        // Full string at 22 bytes.
+        assert_eq!(truncate_str(&s, 22), s);
+    }
+
+    #[test]
+    fn truncate_str_3_byte_boundary() {
+        // "a\u{0800}b" — 3-byte char between ASCII.
+        // U+0800 (Samaritan letter alaf) encodes as 3 bytes: E0 A0 80.
+        let s = "a\u{0800}b";
+        assert_eq!(truncate_str(s, 1), "a");
+        assert_eq!(truncate_str(s, 2), "a");
+        assert_eq!(truncate_str(s, 4), "a\u{0800}");
+        assert_eq!(truncate_str(s, 5), "a\u{0800}b");
+    }
+
+    #[test]
+    fn truncate_str_all_continuation_bytes() {
+        // A 4-byte char. The continuation bytes (10xxxxxx) are valid
+        // ASCII-range octets in their own right. Safe truncation must
+        // scan backward for the leading byte rather than stopping at a
+        // lone continuation byte.
+        let s = "a\u{1f600}b"; // grinning face = 4 bytes
+        assert_eq!(truncate_str(s, 1), "a");
+        assert_eq!(truncate_str(s, 2), "a");
+        assert_eq!(truncate_str(s, 5), "a\u{1f600}");
+    }
+
+    #[test]
+    fn truncate_str_validates_no_utf8_replacement_characters() {
+        // Ensure no replacement character U+FFFD appears when truncation
+        // cuts at an awkward boundary. Iterate every truncation length
+        // for a mixed string.
+        let mixed = "Hi🚀🌍!";
+        for max in 0..=mixed.len() {
+            let t = truncate_str(mixed, max);
+            assert!(
+                t.len() <= max,
+                "length {len} exceeds max {max}: {t:?}",
+                len = t.len(),
+            );
+            assert!(
+                std::str::from_utf8(t.as_bytes()).is_ok(),
+                "truncated string is not valid UTF-8 at max={max}: {t:?}",
+            );
+            assert!(
+                !t.contains('\u{FFFD}'),
+                "truncated string contains replacement character at max={max}: {t:?}"
+            );
+            // Verify it's the longest possible prefix by checking that
+            // the next character boundary would exceed max.
+            if max < mixed.len() {
+                let next_boundary = t.len() + mixed[t.len()..].chars().next().unwrap().len();
+                assert!(
+                    next_boundary > max,
+                    "not longest prefix at max={max}: {t:?} vs mixed bytes {next_boundary}",
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn truncate_str_cjk() {
+        // Each CJK character is 3 bytes.
+        let s = "中文测试";
+        assert_eq!(truncate_str(s, 3), "中");
+        assert_eq!(truncate_str(s, 5), "中");
+        assert_eq!(truncate_str(s, 6), "中文");
+        assert_eq!(truncate_str(s, 8), "中文");
+        assert_eq!(truncate_str(s, 9), "中文测");
+        assert_eq!(truncate_str(s, 12), "中文测试");
+    }
+
+    #[test]
+    fn truncate_str_surrogate_free() {
+        // Supplementary plane characters (emoji, rare CJK) are 4 bytes
+        // in UTF-8 and must not be split.
+        let s = "a\u{1f600}b\u{1f601}c"; // grin, grin-with-smiling-eyes
+        assert_eq!(truncate_str(s, 1), "a");
+        assert_eq!(truncate_str(s, 5), "a\u{1f600}");
+        assert_eq!(truncate_str(s, 6), "a\u{1f600}b");
+        assert_eq!(truncate_str(s, 10), "a\u{1f600}b\u{1f601}");
+        assert_eq!(truncate_str(s, 11), "a\u{1f600}b\u{1f601}c");
+    }
+
+    #[test]
+    fn truncate_str_zero_width_joiners() {
+        // Family emoji: man + ZWJ + woman + ZWJ + girl + ZWJ + boy
+        // Each ZWJ (U+200D) is 3 bytes.
+        let family = "\u{1f468}\u{200d}\u{1f469}\u{200d}\u{1f467}\u{200d}\u{1f466}";
+        assert_eq!(truncate_str(family, 0), "");
+        assert_eq!(truncate_str(family, 4), "");
+        assert_eq!(truncate_str(family, family.len()), family);
+        let t = truncate_str(family, 7);
+        // Should only contain whole characters, no replacement chars.
+        assert!(std::str::from_utf8(t.as_bytes()).is_ok());
+        assert!(!t.contains('\u{FFFD}'));
+    }
+
+    #[test]
+    fn truncate_model_name_tool_name_ascii() {
+        // Typical provider and tool names are ASCII — must remain unchanged.
+        for name in &["gpt-4o", "claude-sonnet-4-6", "web_search", "file_read"] {
+            assert_eq!(truncate_str(name, 64), *name);
+            assert_eq!(truncate_str(name, name.len()), *name);
+        }
     }
 }
