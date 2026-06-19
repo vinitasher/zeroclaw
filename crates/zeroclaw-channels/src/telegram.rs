@@ -4126,7 +4126,10 @@ mod tests {
         );
 
         // is_voice_chat resolves live via voice_peer_resolver — no cache.
-        assert!(ch.is_voice_chat("@alice"), "voice peer should be recognized");
+        assert!(
+            ch.is_voice_chat("@alice"),
+            "voice peer should be recognized"
+        );
         assert!(ch.is_voice_chat("@bob"), "voice peer should be recognized");
         assert!(
             !ch.is_voice_chat("@carol"),
