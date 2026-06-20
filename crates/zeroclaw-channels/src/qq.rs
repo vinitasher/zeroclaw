@@ -947,7 +947,8 @@ impl QQChannel {
                     file_name.as_deref(),
                 )
                 .await?;
-            self.send_media_message(recipient, &file_info, in_reply_to).await?;
+            self.send_media_message(recipient, &file_info, in_reply_to)
+                .await?;
         } else {
             // Local file upload
             let path = Path::new(target);
@@ -1003,7 +1004,8 @@ impl QQChannel {
                     .await;
             }
 
-            self.send_media_message(recipient, &file_info, in_reply_to).await?;
+            self.send_media_message(recipient, &file_info, in_reply_to)
+                .await?;
         }
 
         Ok(())
@@ -1320,7 +1322,10 @@ impl Channel for QQChannel {
 
         // Send each media attachment
         for attachment in &attachments {
-            if let Err(e) = self.send_attachment(&message.recipient, attachment, None).await {
+            if let Err(e) = self
+                .send_attachment(&message.recipient, attachment, None)
+                .await
+            {
                 ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown).with_attrs(::serde_json::json!({"target": attachment.target, "error": format!("{}", e)})), "failed to send media attachment; falling back to text");
                 // Degrade to text fallback
                 let fallback = format!(
