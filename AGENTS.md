@@ -186,19 +186,26 @@ Branch/commit/PR rules:
 scripts/agent-preflight.sh "fix(scope): your conventional-commit title"
 ```
 
-Idempotent (auto-applies `rustfmt`; everything else is read-only). It runs the
-**same gates CI enforces**, so a green preflight means a green PR:
+Idempotent (auto-applies `rustfmt`; everything else is read-only). It provides
+high-fidelity local parity for CI's fmt, clippy, check, and test gates by using
+the same flags. A green preflight is strong evidence, but not an absolute CI
+guarantee because local toolchains, system packages, caches, and runner
+platforms can still differ:
 
 1. `cargo fmt --all` then `--check` — CI's `Format` job gates everything; an
    unformatted branch skips all other checks and fails `CI Required Gate`.
 2. `scripts/ci/rust_quality_gate.sh --strict` — clippy `-D warnings` plus the
    provider-dispatch SSOT gate.
-2b. `cargo clippy/check --all-targets --all-features` — CI's `Lint` and
-   `Check (all features)` jobs run with `--all-features`, which the repo gate
-   above does not; feature-gated breakage slips past default-feature checks.
-3. `cargo check --all-targets --locked` — every target must compile. Never push
-   code you did not build.
-4. `cargo test --locked`.
+2b. `cargo clippy --workspace --exclude zeroclaw-desktop --all-targets --features ci-all -- -D warnings`
+   — mirrors CI's `Lint` job curated feature set.
+3. `cargo check --locked --features ci-all` and
+   `cargo check --locked --no-default-features` — mirror CI's `Check` matrix.
+4. `cargo nextest run --locked --workspace --exclude zeroclaw-desktop` — mirrors
+   CI's `Test` job; if `cargo-nextest` is unavailable locally, preflight falls
+   back to `cargo test --locked --workspace --exclude zeroclaw-desktop`.
+4b. `cargo test --test architecture tests_that_persist_config_isolate_the_path`
+   and `cargo test --test architecture user_facing_strings_route_through_fluent`
+   — mirror CI's architecture guards.
 5. `scripts/check-pr-title.sh "<title>"` — the `main` check requires Conventional
    Commits **with a scope** (`type(scope): description`); `[Bug]:` / `[Tracker]:`
    / `[Feature]:` titles are rejected.
@@ -212,7 +219,6 @@ on red. Pipelines must additionally:
 - **Use the human author identity** with no AI-attribution footers (see the PR
   template and the privacy contract).
 - **Rate-limit** PRs per repo per run to avoid flooding review and CI.
-
 
 ## Anti-Patterns
 
