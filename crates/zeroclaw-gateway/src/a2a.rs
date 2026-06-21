@@ -277,9 +277,10 @@ fn identity_name_line(names: zeroclaw_runtime::identity::Names) -> Option<String
     names.nickname.filter(|s| !s.trim().is_empty())
 }
 
-/// Resolve the alias's exposed skills: the resolved bundle skill set narrowed
-/// by `exposed_skills`. An empty filter advertises no skills. Skill ids that
-/// do not resolve to a real skill are dropped (bundles are canonical).
+/// Resolve the alias's exposed skills: the resolved bundle skill set, after the
+/// owning bundle's include/exclude filter, narrowed by `exposed_skills`. An
+/// empty filter advertises no skills. Skill ids that do not resolve to a real,
+/// admitted skill are dropped (bundles are canonical).
 fn exposed_skills(config: &Config, alias: &str) -> Vec<AgentSkill> {
     let agent = match config.agents.get(alias) {
         Some(a) => a,
@@ -299,7 +300,12 @@ fn exposed_skills(config: &Config, alias: &str) -> Vec<AgentSkill> {
     let mut out = Vec::new();
     for wanted in &agent.a2a.exposed_skills {
         if let Some(summary) = resolved.iter().find(|s| {
-            s.r#ref.name() == wanted && agent.skill_bundles.iter().any(|b| b == s.r#ref.bundle())
+            s.r#ref.name() == wanted
+                && agent.skill_bundles.iter().any(|b| b == s.r#ref.bundle())
+                && config
+                    .skill_bundles
+                    .get(s.r#ref.bundle())
+                    .is_some_and(|bundle| bundle.admits_skill(s.r#ref.name()))
         }) {
             let mut tags = vec![summary.r#ref.bundle().to_string()];
             if let Some(category) = &summary.frontmatter.category {
@@ -661,6 +667,30 @@ mod tests {
             catalog.skills[0].tags,
             vec!["demo".to_string(), "maker".to_string()]
         );
+    }
+
+    #[test]
+    fn exposed_skills_drop_when_bundle_filter_excludes_them() {
+        let tmp = tempfile::tempdir().expect("tmp");
+        write_skill(tmp.path(), "demo", "widget", "Widget");
+        write_skill(tmp.path(), "demo", "gadget", "Gadget");
+
+        let mut config = config_with_published_alias("maker", true);
+        config.config_path = tmp.path().join("config.toml");
+        let bundle = zeroclaw_config::schema::SkillBundleConfig {
+            exclude: vec!["gadget".to_string()],
+            ..Default::default()
+        };
+        config.skill_bundles.insert("demo".to_string(), bundle);
+        {
+            let agent = config.agents.get_mut("maker").unwrap();
+            agent.skill_bundles = vec!["demo".to_string()];
+            agent.a2a.exposed_skills = vec!["widget".to_string(), "gadget".to_string()];
+        }
+
+        let card = build_agent_card(&config, "maker").expect("card");
+        let ids: Vec<&str> = card.skills.iter().map(|s| s.id.as_str()).collect();
+        assert_eq!(ids, vec!["widget"]);
     }
 
     #[test]

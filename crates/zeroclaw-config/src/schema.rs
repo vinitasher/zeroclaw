@@ -10251,6 +10251,17 @@ pub struct SkillBundleConfig {
     pub exclude: Vec<String>,
 }
 
+impl SkillBundleConfig {
+    /// Whether a skill name survives this bundle's include/exclude filter.
+    /// Empty `include` admits every name; `exclude` always wins.
+    pub fn admits_skill(&self, name: &str) -> bool {
+        if !self.include.is_empty() && !self.include.iter().any(|s| s == name) {
+            return false;
+        }
+        !self.exclude.iter().any(|s| s == name)
+    }
+}
+
 /// Named knowledge bundle (`[knowledge_bundles.<alias>]`).
 ///
 /// A reusable set of knowledge sources (documents, URLs, or RAG corpus paths)
@@ -18706,6 +18717,19 @@ impl HasPropKind for serde_json::Value {
 
 #[cfg(test)]
 mod tests {
+
+    #[::core::prelude::v1::test]
+    fn skill_bundle_admits_skill_honors_include_and_exclude() {
+        let mut bundle = super::SkillBundleConfig::default();
+        assert!(bundle.admits_skill("anything"));
+
+        bundle.include = vec!["widget".into()];
+        assert!(bundle.admits_skill("widget"));
+        assert!(!bundle.admits_skill("gadget"));
+
+        bundle.exclude = vec!["widget".into()];
+        assert!(!bundle.admits_skill("widget"));
+    }
 
     #[test]
     async fn amqp_validate_requires_paired_client_cert_and_key() {

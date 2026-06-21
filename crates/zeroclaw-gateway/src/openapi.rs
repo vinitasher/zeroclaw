@@ -329,6 +329,7 @@ fn augment_spec_with_a2a(
             serde_json::json!({
                 "post": {
                     "tags": ["a2a"],
+                    "security": [],
                     "summary": "Send a task to a published A2A agent",
                     "description": "JSON-RPC 2.0 endpoint for one published agent. Only `message/send` is handled: the message `parts` of kind `text` are joined into the agent prompt, the agent runs one turn, and a completed A2A `Task` carrying the reply as an artifact is returned. Unpublished or disabled aliases return 404. The server must be enabled (`[a2a.server] enabled`) and the alias published (`[agents.<alias>.a2a] published`).",
                     "parameters": [{
@@ -501,5 +502,15 @@ mod tests {
             .pointer("/components/securitySchemes/bearerAuth/scheme")
             .and_then(|v| v.as_str());
         assert_eq!(scheme, Some("bearer"));
+    }
+
+    #[cfg(all(feature = "schema-export", feature = "a2a"))]
+    #[test]
+    fn a2a_task_operation_opts_out_of_bearer_auth() {
+        let spec = build_spec();
+        let security = spec
+            .pointer("/paths/~1a2a~1{alias}/post/security")
+            .and_then(|v| v.as_array());
+        assert_eq!(security, Some(&vec![]));
     }
 }
