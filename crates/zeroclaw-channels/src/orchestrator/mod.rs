@@ -18439,6 +18439,142 @@ This is an example JSON object for profile settings."#;
         );
     }
 
+    #[cfg(feature = "channel-lark")]
+    #[test]
+    fn collect_configured_channels_feishu_binding_reaches_tool_capable_agent_route() {
+        use zeroclaw_config::multi_agent::{AgentAlias, PeerGroupConfig, PeerUsername};
+
+        let mut config = Config::default();
+        config.channels.lark.insert(
+            "work".to_string(),
+            zeroclaw_config::schema::LarkConfig {
+                enabled: true,
+                app_id: "cli_feishu_app123".to_string(),
+                app_secret: "test-secret".to_string(),
+                use_feishu: true,
+                ack_reactions: Some(false),
+                ..Default::default()
+            },
+        );
+        config.agents.clear();
+        config.agents.insert(
+            "feishu-agent".to_string(),
+            zeroclaw_config::schema::AliasedAgentConfig {
+                enabled: true,
+                channels: vec!["feishu.work".into()],
+                ..Default::default()
+            },
+        );
+        config.peer_groups.insert(
+            "feishu_ops".to_string(),
+            PeerGroupConfig {
+                channel: "feishu.work".into(),
+                agents: vec![AgentAlias::new("feishu-agent")],
+                external_peers: vec![PeerUsername::new("@operator")],
+                ..Default::default()
+            },
+        );
+
+        let config_arc = Arc::new(RwLock::new(config.clone()));
+        let configured_channels = collect_configured_channels(&config_arc, "test", &[]);
+
+        let feishu = configured_channels
+            .iter()
+            .find(|entry| entry.alias.as_deref() == Some("work"))
+            .expect("feishu.work binding must be collected from [channels.lark.work]");
+        assert_eq!(feishu.display_name, "Feishu");
+        assert_eq!(feishu.channel.name(), "feishu");
+
+        let mut channels_by_name: HashMap<String, Arc<dyn Channel>> = HashMap::new();
+        let collected_channel_keys: Vec<String> = configured_channels
+            .iter()
+            .map(|entry| {
+                let key = composite_channel_key(entry.channel.name(), entry.alias.as_deref());
+                channels_by_name.insert(key.clone(), Arc::clone(&entry.channel));
+                key
+            })
+            .collect();
+        assert!(
+            collected_channel_keys
+                .iter()
+                .any(|key| key == "feishu.work"),
+            "startup collection must expose the Feishu alias key, got {collected_channel_keys:?}"
+        );
+
+        let enabled_agents = vec!["feishu-agent".to_string()];
+        let owners = build_owner_by_channel_key(&config, &enabled_agents, &collected_channel_keys);
+        assert_eq!(
+            owners.get("feishu.work").map(String::as_str),
+            Some("feishu-agent"),
+            "a feishu.<alias> agent binding must own the collected Feishu channel key"
+        );
+
+        let msg = channel_message("feishu", Some("work"));
+        assert!(
+            find_channel_for_message(&channels_by_name, &msg).is_some(),
+            "a Feishu inbound message must resolve to the collected live channel"
+        );
+
+        let tools_registry: Arc<Vec<Box<dyn Tool>>> = Arc::new(vec![Box::new(
+            zeroclaw_runtime::tools::SendMessageToPeerTool::new(
+                Arc::new(config.clone()),
+                "feishu-agent",
+            ),
+        )]);
+        let provider = Arc::new(HistoryCaptureModelProvider::default());
+        let base_ctx = (*peer_prompt_test_context(
+            channels_by_name,
+            provider,
+            Arc::new(config.clone()),
+            tools_registry,
+        ))
+        .clone();
+        let runtime_ctx = Arc::new(ChannelRuntimeContext {
+            agent_alias: Arc::new("feishu-agent".to_string()),
+            agent_cfg: Arc::new(
+                config
+                    .agents
+                    .get("feishu-agent")
+                    .expect("test config must include feishu-agent")
+                    .clone(),
+            ),
+            ..base_ctx
+        });
+
+        let mut by_agent: HashMap<String, Arc<ChannelRuntimeContext>> = HashMap::new();
+        by_agent.insert("feishu-agent".to_string(), Arc::clone(&runtime_ctx));
+        let router = AgentRouter::multi(by_agent, owners);
+
+        let resolved = router
+            .resolve(&msg)
+            .expect("Feishu inbound must route to the owning agent context");
+        assert!(Arc::ptr_eq(&resolved, &runtime_ctx));
+        // NB: intentionally NOT asserting tool availability on `resolved` — the tool was
+        // supplied by this test's `tools_registry`, so such a check would be tautological.
+        // The non-circular proof of #4873 is that the inbound Feishu message routes to the
+        // bound *agent* context (owned, above) scoped to the Feishu channel ref below —
+        // i.e. the agent path, not the LLM-only fallback.
+        assert_eq!(
+            peer_prompt_channel_ref(resolved.as_ref(), &msg).as_deref(),
+            Some("feishu.work")
+        );
+
+        let peer_map =
+            zeroclaw_runtime::tools::send_message_to_peer::render_sender_peer_map_for_channel(
+                resolved.prompt_config.as_ref(),
+                resolved.agent_alias.as_str(),
+                "feishu.work",
+            );
+        assert!(
+            peer_map.contains("Current-channel peer map for agent \"feishu-agent\""),
+            "Feishu agent path should render the same peer/tool context as other channels: {peer_map}"
+        );
+        assert!(
+            peer_map.contains("external peers: \"operator\""),
+            "Feishu peer map must be derived from the current Feishu channel ref: {peer_map}"
+        );
+    }
+
     #[cfg(feature = "channel-email")]
     #[test]
     fn collect_configured_channels_skips_unreferenced_email() {
