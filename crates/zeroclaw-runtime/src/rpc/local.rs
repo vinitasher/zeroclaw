@@ -37,8 +37,8 @@ const ENFILE: i32 = 23; // too many open files (system-wide)
 /// Returns `true` when an error from a stream listener's `accept()` is
 /// transient and the listener itself remains usable, so the serve loop
 /// should log and keep running rather than terminating the daemon. Covers
-/// file-descriptor exhaustion (`EMFILE`/`ENFILE`, see #7042) and the usual
-/// per-connection hiccups.
+/// file-descriptor exhaustion (`EMFILE`/`ENFILE`, see #7042), buffer
+/// pressure (`ENOBUFS`), and the usual per-connection hiccups.
 fn is_recoverable_accept_error(e: &std::io::Error) -> bool {
     if matches!(
         e.kind(),
@@ -47,8 +47,13 @@ fn is_recoverable_accept_error(e: &std::io::Error) -> bool {
         return true;
     }
     #[cfg(unix)]
-    if matches!(e.raw_os_error(), Some(EMFILE) | Some(ENFILE)) {
-        return true;
+    if let Some(errno) = e.raw_os_error() {
+        // `ENOBUFS` is reported as `ErrorKind::Other` by tokio on Linux
+        // (errno 55) and macOS (errno 105). Inline both values so the
+        // check compiles on every Unix target we support.
+        if matches!(errno, EMFILE | ENFILE | 55 | 105) {
+            return true;
+        }
     }
     false
 }
@@ -762,6 +767,17 @@ mod accept_error_tests {
         // #7042: EMFILE/ENFILE must not terminate the daemon.
         assert!(is_recoverable_accept_error(&Error::from_raw_os_error(24))); // EMFILE
         assert!(is_recoverable_accept_error(&Error::from_raw_os_error(23))); // ENFILE
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn enobufs_accept_errors_are_recoverable() {
+        // #7042: ENOBUFS ("no buffer space available") is a transient
+        // accept() error under memory / socket-skeleton pressure. The
+        // listener itself stays valid — the serve loop must back off and
+        // keep running, not tear down the daemon.
+        assert!(is_recoverable_accept_error(&Error::from_raw_os_error(55))); // Linux ENOBUFS
+        assert!(is_recoverable_accept_error(&Error::from_raw_os_error(105))); // macOS ENOBUFS
     }
 
     #[test]
